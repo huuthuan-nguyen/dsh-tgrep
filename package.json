@@ -1,4 +1,10 @@
 {
+  "author": "Thuan Nguyen <huuthuan.nguyen@hotmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huuthuan-nguyen/dsh-tgrep"
+  },
+  "homepage": "https://github.com/huuthuan-nguyen/dsh-tgrep#readme",
   "name": "dsh-tgrep",
   "version": "0.1.0",
   "description": "Shadow built-in grep with Microsoft tgrep (trigram-indexed search) for DeepSeek Harness",
