@@ -60,7 +60,7 @@ You can also install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.0
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.1
 ```
 
 ### Method 3: From Local Checkout (For development/contributors)
