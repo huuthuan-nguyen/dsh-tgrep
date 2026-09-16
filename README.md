@@ -1,5 +1,9 @@
 # dsh-tgrep
 
+[![npm version](https://img.shields.io/npm/v/dsh-tgrep.svg)](https://www.npmjs.com/package/dsh-tgrep)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![GitHub release](https://img.shields.io/github/v/release/huuthuan-nguyen/dsh-tgrep)](https://github.com/huuthuan-nguyen/dsh-tgrep/releases)
+
 Shadow the built-in `grep` tool in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with [Microsoft tgrep](https://github.com/microsoft/tgrep) (trigram-indexed fast regex search).
 
 Provides orders-of-magnitude faster code searches on medium-to-large repositories while retaining full compatibility with DeepSeek Harness's interactive Web GUI search cards and Programmatic Tool Calling (PTC) mode.
@@ -9,10 +13,11 @@ Provides orders-of-magnitude faster code searches on medium-to-large repositorie
 ## Features
 
 - **Trigram-indexed search**: Instant query latency across millions of lines of code using `tgrep`.
-- **Full Web GUI integration**: Automatically generates structured search metadata so DeepSeek Harness renders native expandable file groups and match counters.
+- **Full Web GUI integration**: Generates structured search metadata so DeepSeek Harness renders native expandable file groups, match counters, and quick jumps.
 - **Graceful degradation**: Searches directly if no index is built yet; automatically utilizes `tgrep serve` background daemon if running.
 - **PTC & agent-plane shadowing**: Scoped to each agent so it cleanly replaces built-in ripgrep without modifying stock system presets.
 - **Safe parameter handling**: Immune to CLI flag injection (`--regexp` and `--` boundaries); supports regex, `include` glob filters, and case-insensitive flags.
+- **Zero build steps**: Pure modern ESM JavaScript — installs and runs directly without compiling.
 
 ---
 
@@ -34,19 +39,37 @@ Provides orders-of-magnitude faster code searches on medium-to-large repositorie
 
 ## Installation
 
-### Into your DeepSeek Harness profile (e.g. `web` or `tui`)
+You do **not** need to clone or compile this repository manually. DeepSeek Harness installs it directly into any profile:
 
-From npm:
+### Method 1: Directly from NPM Registry (Recommended)
+
 ```bash
+# For Web GUI profile
 dsh plugin --profile web add dsh-tgrep
+
+# Or for headless / TUI profile
+dsh plugin --profile tui add dsh-tgrep
 ```
 
-Or from a local checkout:
+### Method 2: Directly from GitHub (Without manual git clone)
+
+You can also install straight from GitHub, optionally pinned to a release tag:
+
+```bash
+# Latest from default branch
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
+
+# Or pinned to a specific release tag
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.0
+```
+
+### Method 3: From Local Checkout (For development/contributors)
+
 ```bash
 dsh plugin --profile web add ./dsh-tgrep
 ```
 
-Restart your DeepSeek Harness profile (`dsh web` or `dsh --profile web`).
+> **Note:** After installing, simply restart your DeepSeek Harness profile (e.g. `dsh web` or `dsh --profile web`).
 
 ---
 
@@ -90,16 +113,16 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
 
 ## Verification
 
-To verify that the plugin is loaded:
-1. Open DeepSeek Harness Web GUI or CLI.
-2. Ask the assistant: `Search for "name" in package.json using grep.`
-3. The model will invoke `grep` powered by `tgrep`, and the response will be displayed in the native Search card.
+To verify that the plugin is active:
+1. Start DeepSeek Harness: `dsh web`
+2. In the chat, ask the model: `Search for "name" in package.json using grep.`
+3. The model will invoke `grep` powered by `tgrep`, and the matches will render inside the native Search card.
 
 ---
 
 ## Uninstallation
 
-To remove `dsh-tgrep`:
+To remove `dsh-tgrep` from your profile:
 
 ```bash
 dsh plugin --profile web remove dsh-tgrep
@@ -109,4 +132,4 @@ dsh plugin --profile web remove dsh-tgrep
 
 ## License
 
-MIT © 2025-present
+MIT © 2025-present Thuan Nguyen
