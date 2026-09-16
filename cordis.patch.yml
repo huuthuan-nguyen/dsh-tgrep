@@ -1,0 +1,11 @@
+- insert:
+    - id: tgrep
+      name: dsh-tgrep
+      config:
+        enabled: true
+        # Prefer the running tgrep server when available; fall back to one-shot
+        preferServer: true
+        # Soft limit on returned lines (model context protection)
+        maxLines: 300
+        # Extra CLI flags passed to every tgrep invocation (array of strings)
+        extraArgs: []
