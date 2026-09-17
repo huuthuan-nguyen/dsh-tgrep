@@ -60,7 +60,7 @@ You can also install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.1
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.2
 ```
 
 ### Method 3: From Local Checkout (For development/contributors)
@@ -127,6 +127,31 @@ To remove `dsh-tgrep` from your profile:
 ```bash
 dsh plugin --profile web remove dsh-tgrep
 ```
+
+---
+
+## Compatibility & Troubleshooting
+
+### `Cannot read properties of undefined (reading 'prepare')`
+
+On DeepSeek Harness `v0.1.6-alpha.2` and newer, `resolutionMode` defaults to `runtime`,
+which loads the harness from its compiled `lib/` artifacts. Versions `0.1.1` and older
+imported `@deepseek-ai/dsh-tools` at runtime, which could evaluate a **second copy** of that
+package (`src/` next to `lib/`). Because DSH keys its internal tool scheduler with a private
+`Symbol()` (not `Symbol.for()`), the duplicated module produced a different symbol and
+`ctx.tools[TOOL_RUNTIME_SCHEDULER]` became `undefined`, aborting every turn that called `grep`.
+
+Starting with `0.1.2`, `dsh-tgrep` is **zero-dependency**: it never imports harness internals,
+declares its tool parameters as plain standard JSON Schema, and therefore works identically in
+both `link` and `runtime` resolution modes. No action is needed beyond upgrading:
+
+```bash
+dsh plugin --profile web remove dsh-tgrep
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.2
+```
+
+If a turn still fails with that message while another third-party plugin is installed, that
+plugin most likely performs the same forbidden runtime import of `@deepseek-ai/dsh-tools`.
 
 ---
 

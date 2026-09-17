@@ -12,15 +12,6 @@
 import { spawn } from 'node:child_process'
 import { isAbsolute, relative } from 'node:path'
 
-let defineTool
-try {
-  const dshTools = await import('@deepseek-ai/dsh-tools')
-  defineTool = dshTools.defineTool
-} catch {
-  // Graceful fallback when running standalone outside of DSH runtime
-  defineTool = (def) => def
-}
-
 export const name = 'dsh-tgrep'
 
 export const inject = ['tools']
@@ -137,37 +128,60 @@ export function apply(ctx, config = {}) {
 }
 
 /**
- * Construct the model-facing `grep` ToolDefinition.
+ * Normalize a partial plugin config into the exact tool-closure facts.
+ * `createGrepTool` is callable directly (tests, embedding), so it never
+ * assumes `apply` already filled every field in.
  */
-function createGrepTool(cfg) {
-  return defineTool({
+function normalizeToolConfig(cfg) {
+  const source = cfg && typeof cfg === 'object' ? cfg : {}
+  return {
+    preferServer: source.preferServer !== false,
+    maxLines: clamp(Number(source.maxLines) || 300, 20, 5000),
+    extraArgs: Array.isArray(source.extraArgs) ? source.extraArgs.map(String) : [],
+  }
+}
+
+/**
+ * Construct the model-facing `grep` ToolDefinition.
+ *
+ * Returns a plain object conforming to the harness `ToolDefinition` contract.
+ * It deliberately imports nothing from the harness: a plugin that loads
+ * `@deepseek-ai/dsh-tools` itself can evaluate a second copy of that package,
+ * and the private scheduler `Symbol()` then mismatches the host's.
+ */
+export function createGrepTool(cfg) {
+  const { preferServer, maxLines, extraArgs } = normalizeToolConfig(cfg)
+  return {
     name: 'grep',
     description:
       'Search file contents with Microsoft tgrep (trigram index). ' +
       'Returns matching lines with line numbers, grouped by file. ' +
       'Use path to limit the search tree, or include to filter file names.',
     parameters: {
-      pattern: {
-        type: 'string',
-        required: true,
-        description: 'Regular expression or literal text to search for (ripgrep syntax).',
+      type: 'object',
+      properties: {
+        pattern: {
+          type: 'string',
+          description: 'Regular expression or literal text to search for (ripgrep syntax).',
+        },
+        path: {
+          type: 'string',
+          description: 'Directory or file to search (default: session workspace root).',
+        },
+        include: {
+          type: 'string',
+          description: 'One glob filter for file names (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.',
+        },
+        case_insensitive: {
+          type: 'boolean',
+          description: 'Case-insensitive search (passes -i to tgrep).',
+        },
+        max_results: {
+          type: 'number',
+          description: `Soft limit on returned matches (default ${maxLines}).`,
+        },
       },
-      path: {
-        type: 'string',
-        description: 'Directory or file to search (default: session workspace root).',
-      },
-      include: {
-        type: 'string',
-        description: 'One glob filter for file names (e.g. "*.ts", "*.{js,jsx}"). Not a list; negation is not supported.',
-      },
-      case_insensitive: {
-        type: 'boolean',
-        description: 'Case-insensitive search (passes -i to tgrep).',
-      },
-      max_results: {
-        type: 'number',
-        description: `Soft limit on returned matches (default ${cfg.maxLines}).`,
-      },
+      required: ['pattern'],
     },
     output: {
       schema: {
@@ -176,37 +190,42 @@ function createGrepTool(cfg) {
         properties: {
           matches: {
             type: 'array',
-            required: true,
             items: {
               type: 'object',
               additionalProperties: true,
               properties: {
-                path: { type: 'string', required: true },
-                lineNumber: { type: 'integer', required: true },
-                line: { type: 'string', required: true },
+                path: { type: 'string' },
+                lineNumber: { type: 'integer' },
+                line: { type: 'string' },
               },
+              required: ['path', 'lineNumber', 'line'],
             },
           },
         },
+        required: ['matches'],
       },
       render: (args, value) => {
-        const maxMatches = clamp(Number(args.max_results) || cfg.maxLines, 20, 5000)
+        const maxMatches = clamp(Number(args?.max_results) || maxLines, 20, 5000)
         return [{
           type: 'text',
-          text: formatGrepMatches(value.matches, maxMatches),
+          text: formatGrepMatches(value?.matches ?? [], maxMatches),
         }]
       },
       presentationMeta: (args, value) => {
-        const maxMatches = clamp(Number(args.max_results) || cfg.maxLines, 20, 5000)
+        const matches = value?.matches ?? []
+        const maxMatches = clamp(Number(args?.max_results) || maxLines, 20, 5000)
         return {
           shape: 'matches',
-          files: groupMatchesByFile(value.matches.slice(0, maxMatches)),
-          truncated: value.matches.length > maxMatches,
-          total: value.matches.length,
+          files: groupMatchesByFile(matches.slice(0, maxMatches)),
+          truncated: matches.length > maxMatches,
+          total: matches.length,
         }
       },
     },
     async execute(args, exec) {
+      if (!args || typeof args !== 'object') {
+        throw new Error('grep: arguments must be an object')
+      }
       if (typeof args.pattern !== 'string' || args.pattern.length === 0) {
         throw new Error('pattern must be a non-empty string')
       }
@@ -217,7 +236,7 @@ function createGrepTool(cfg) {
         validateInclude(args.include)
       }
 
-      const maxMatches = clamp(Number(args.max_results) || cfg.maxLines, 20, 5000)
+      const maxMatches = clamp(Number(args.max_results) || maxLines, 20, 5000)
       const workdir = resolveCwd(exec)
       const searchPath = args.path ? String(args.path) : '.'
 
@@ -231,11 +250,11 @@ function createGrepTool(cfg) {
         cliArgs.push('-g', String(args.include))
       }
 
-      if (cfg.preferServer === false) {
+      if (preferServer === false) {
         cliArgs.push('--no-index')
       }
 
-      for (const a of cfg.extraArgs) {
+      for (const a of extraArgs) {
         cliArgs.push(a)
       }
 
@@ -251,7 +270,7 @@ function createGrepTool(cfg) {
 
       return { matches }
     },
-  })
+  }
 }
 
 /**

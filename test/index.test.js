@@ -4,11 +4,81 @@ import {
   Config,
   apply,
   clamp,
+  createGrepTool,
   formatGrepMatches,
   groupMatchesByFile,
   toRelativePath,
   validateInclude,
 } from '../index.js'
+
+describe('createGrepTool schema and definition', () => {
+  it('creates valid ToolDefinition with standard JSON Schema parameters', () => {
+    const tool = createGrepTool({ maxLines: 300 })
+    assert.equal(tool.name, 'grep')
+    assert.equal(typeof tool.description, 'string')
+    assert.equal(tool.parameters.type, 'object')
+    assert.ok(tool.parameters.properties)
+    assert.ok(tool.parameters.properties.pattern)
+    assert.equal(tool.parameters.properties.pattern.type, 'string')
+    assert.deepEqual(tool.parameters.required, ['pattern'])
+    assert.equal(tool.output.schema.type, 'object')
+    assert.equal(typeof tool.output.render, 'function')
+    assert.equal(typeof tool.output.presentationMeta, 'function')
+    assert.equal(typeof tool.execute, 'function')
+  })
+
+  it('rejects execution when arguments is not an object or pattern is missing', async () => {
+    const tool = createGrepTool({ maxLines: 300 })
+    await assert.rejects(() => tool.execute(null, {}), /arguments must be an object/)
+    await assert.rejects(() => tool.execute({}, {}), /pattern must be a non-empty string/)
+    await assert.rejects(() => tool.execute({ pattern: '' }, {}), /pattern must be a non-empty string/)
+  })
+
+  it('tolerates a partial or missing config (no defineTool defaults applied upstream)', () => {
+    for (const cfg of [undefined, {}, { maxLines: 500 }, { extraArgs: ['--stats'] }]) {
+      assert.doesNotThrow(() => createGrepTool(cfg))
+    }
+    const bare = createGrepTool()
+    assert.match(bare.parameters.properties.max_results.description, /default 300/)
+    assert.deepEqual(bare.output.render({}, { matches: [] }), [{ type: 'text', text: '(no matches)' }])
+  })
+
+  it('declares standard JSON Schema only, never defineTool shorthand', () => {
+    const tool = createGrepTool({ maxLines: 300 })
+    for (const [label, schema] of [['parameters', tool.parameters], ['output.schema', tool.output.schema]]) {
+      walk(schema, (node, path) => {
+        if (node.required !== undefined) {
+          assert.ok(
+            Array.isArray(node.required) && node.required.every(name => typeof name === 'string'),
+            `${label}${path}.required must be a string array`,
+          )
+          for (const name of node.required) {
+            assert.ok(
+              node.properties !== undefined && Object.hasOwn(node.properties, name),
+              `${label}${path}.required names unknown property ${name}`,
+            )
+          }
+        }
+        if (node.properties !== undefined) {
+          for (const [name, child] of Object.entries(node.properties)) {
+            assert.equal(child.required, undefined, `${label}${path}.properties.${name} must not carry a boolean required`)
+          }
+        }
+      })
+    }
+  })
+})
+
+/** Visit every nested schema object reachable from `node`. */
+function walk(node, visit, path = '') {
+  if (node === null || typeof node !== 'object') return
+  visit(node, path)
+  if (node.properties) {
+    for (const [name, child] of Object.entries(node.properties)) walk(child, visit, `${path}.properties.${name}`)
+  }
+  if (node.items) walk(node.items, visit, `${path}.items`)
+  if (Array.isArray(node.oneOf)) node.oneOf.forEach((child, index) => walk(child, visit, `${path}.oneOf[${index}]`))
+}
 
 describe('dsh-tgrep Config schema', () => {
   it('supplies defaults for empty config', () => {
