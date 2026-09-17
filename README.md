@@ -1,28 +1,65 @@
-# dsh-tgrep
+# ⚡ DSH-Tgrep: Trigram-Indexed Code Search for DeepSeek Harness
 
-[![npm version](https://img.shields.io/npm/v/dsh-tgrep.svg)](https://www.npmjs.com/package/dsh-tgrep)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/huuthuan-nguyen/dsh-tgrep)](https://github.com/huuthuan-nguyen/dsh-tgrep/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![DeepSeek Harness plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4D6BFE)](https://github.com/deepseek-ai/deepseek-harness)
+[![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-2ea44f)](https://github.com/topics/dsh-plugin)
+[![Powered by Microsoft tgrep](https://img.shields.io/badge/powered%20by-Microsoft%20tgrep-0078D4)](https://github.com/microsoft/tgrep)
 
-Shadow the built-in `grep` tool in [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with [Microsoft tgrep](https://github.com/microsoft/tgrep) (trigram-indexed fast regex search).
-
-Provides orders-of-magnitude faster code searches on medium-to-large repositories while retaining full compatibility with DeepSeek Harness's interactive Web GUI search cards and Programmatic Tool Calling (PTC) mode.
-
----
-
-## Features
-
-- **Trigram-indexed search**: Instant query latency across millions of lines of code using `tgrep`.
-- **Full Web GUI integration**: Generates structured search metadata so DeepSeek Harness renders native expandable file groups, match counters, and quick jumps.
-- **Graceful degradation**: Searches directly if no index is built yet; automatically utilizes `tgrep serve` background daemon if running.
-- **PTC & agent-plane shadowing**: Scoped to each agent so it cleanly replaces built-in ripgrep without modifying stock system presets.
-- **Safe parameter handling**: Immune to CLI flag injection (`--regexp` and `--` boundaries); supports regex, `include` glob filters, and case-insensitive flags.
-- **Zero build steps**: Pure modern ESM JavaScript — installs and runs directly without compiling.
-- **Zero runtime dependencies**: Never imports harness internals; the tool contract is plain JSON Schema.
+<p align="center">
+  <b>Trigram-indexed <code>grep</code> for DeepSeek Harness agents — fast code search on medium-to-large repositories.</b><br>
+  Shadows the built-in <code>grep</code> tool with <b>Microsoft <code>tgrep</code></b> while keeping the native Web GUI search cards, Programmatic Tool Calling (PTC) mode, and the stock tool contract intact.
+</p>
 
 ---
 
-## Tool Contract
+## 🌟 Why DSH-Tgrep?
+
+The stock `grep` tool ships a bundled ripgrep binary and re-scans the workspace on every call.
+On medium-to-large repositories the same files are read and the same pattern is matched again
+and again, so search latency grows with the size of the tree and with how often the agent
+searches. `dsh-tgrep` keeps the exact tool the model already knows and swaps the engine
+underneath:
+
+1. **Trigram index** — `tgrep` answers a query from its trigram index, so repeated searches
+   over an indexed tree return without re-walking every file.
+2. **Persistent daemon** — a running `tgrep serve` keeps the index hot across calls and
+   sessions, with no per-call cold start.
+3. **Graceful degradation** — with no index and no daemon, `tgrep` scans files much like
+   `grep` does today, so a fresh workspace still works.
+4. **Agent-plane shadowing** — the tool registers into each agent's own tool scope, so it
+   replaces the built-in `grep` per agent without touching stock system presets or the host
+   registry entry.
+5. **Contract parity** — the stock `pattern` / `path` / `include` schema, the 30 s cooperative
+   timeout, the `SearchMeta` payload behind the native search card, and the call/result
+   presenters are all preserved; `case_insensitive` and `max_results` come on top.
+6. **Safe parameter handling** — immune to CLI flag injection (`--regexp` and `--` boundaries).
+7. **Zero runtime dependencies** — pure modern ESM JavaScript, no build step, and no import of
+   any harness internal.
+
+---
+
+## 🚀 Key Highlights & Comparison
+
+| Feature | Stock `grep` (`dsh-tool-fs-search`) | **`dsh-tgrep`** |
+|---|---|---|
+| **Search engine** | Bundled ripgrep binary | **Microsoft `tgrep` (trigram index)** |
+| **Repeated queries** | Re-scans the tree on every call | ✅ **Index-served when indexed (scan fallback)** |
+| **Persistent daemon** | ❌ None | ✅ **`tgrep serve`** |
+| **Without an index** | ✅ Full scan | ✅ **Graceful fallback scan** |
+| **Tool parameters** | `pattern`, `path`, `include` | ✅ Same **+ `case_insensitive`, `max_results`** |
+| **Cooperative timeout** | ✅ 30 000 ms | ✅ **30 000 ms (parity)** |
+| **Web GUI search card** | ✅ Native | ✅ **Native (`presentCall` / `presentResult` + `SearchMeta`)** |
+| **Session-log metadata** | Capped at 64 KiB | ✅ **Capped at 64 KiB, 2000-byte line previews** |
+| **Over-cap results** | Spills the full list to a workspace file | ⚠️ **Inline truncation note (no spill file)** |
+| **PTC mode** | ✅ | ✅ |
+| **Agent-plane shadowing** | Host registry entry | ✅ **Per-agent shadowing, presets untouched** |
+| **Runtime dependency** | Bundled ripgrep | ⚠️ **`tgrep` binary on `PATH`** |
+| **Build step** | Compiled with the harness | ✅ **None — plain ESM** |
+
+---
+
+## 🧩 Tool Contract
 
 `dsh-tgrep` shadows `grep` on the agent plane, so the model sees this contract instead of the
 stock ripgrep one:
@@ -40,7 +77,7 @@ inline and never writes a recovery file.
 
 ---
 
-## Prerequisites
+## 📋 Prerequisites
 
 1. **Node.js**: `>= 22.19.0`
 2. **Microsoft tgrep**: Must be installed and available on `PATH`.
@@ -56,23 +93,13 @@ inline and never writes a recovery file.
 
 ---
 
-## Installation
+## 📦 Installation & Quickstart
 
 You do **not** need to clone or compile this repository manually. DeepSeek Harness installs it directly into any profile:
 
-### Method 1: Directly from NPM Registry (Recommended)
+### Method 1: Directly from GitHub (Recommended)
 
-```bash
-# For Web GUI profile
-dsh plugin --profile web add dsh-tgrep
-
-# Or for headless / TUI profile
-dsh plugin --profile tui add dsh-tgrep
-```
-
-### Method 2: Directly from GitHub (Without manual git clone)
-
-You can also install straight from GitHub, optionally pinned to a release tag:
+Install straight from GitHub, optionally pinned to a release tag:
 
 ```bash
 # Latest from default branch
@@ -80,6 +107,19 @@ dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.3
+```
+
+### Method 2: From the NPM Registry
+
+> ⚠️ **Stale on npm** — the registry's `latest` is still `0.1.0`, published before the
+> `0.1.2`/`0.1.3` fixes. Prefer Method 1 until a newer version is published.
+
+```bash
+# For Web GUI profile
+dsh plugin --profile web add dsh-tgrep
+
+# Or for headless / TUI profile
+dsh plugin --profile tui add dsh-tgrep
 ```
 
 ### Method 3: From Local Checkout (For development/contributors)
@@ -92,7 +132,7 @@ dsh plugin --profile web add ./dsh-tgrep
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 When installed, `dsh-tgrep` contributes a default configuration layer. You can customize settings in your profile's `cordis.patch.yml` or `$DSH_HOME/cordis.patch.yml`:
 
@@ -113,7 +153,7 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
 
 ---
 
-## Indexing Your Codebase (Optional but Recommended)
+## 🗂️ Indexing Your Codebase (Optional but Recommended)
 
 `tgrep` works out-of-the-box without an index by scanning files. For maximum speed in large workspaces:
 
@@ -130,7 +170,7 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
 
 ---
 
-## Verification
+## ✅ Verification
 
 To verify that the plugin is active:
 1. Start DeepSeek Harness: `dsh web`
@@ -139,7 +179,7 @@ To verify that the plugin is active:
 
 ---
 
-## Uninstallation
+## 🧹 Uninstallation
 
 To remove `dsh-tgrep` from your profile:
 
@@ -149,7 +189,7 @@ dsh plugin --profile web remove dsh-tgrep
 
 ---
 
-## Compatibility & Troubleshooting
+## 🧯 Compatibility & Troubleshooting
 
 ### `Cannot read properties of undefined (reading 'prepare')`
 
