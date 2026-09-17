@@ -197,4 +197,4 @@ host's own lookups. The plugin's contract with the harness is exactly the object
 
 ## License
 
-MIT © 2025-present Thuan Nguyen
+MIT © Thuan Nguyen
