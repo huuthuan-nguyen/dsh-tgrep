@@ -17,6 +17,19 @@ export const name = 'dsh-tgrep'
 export const inject = ['tools']
 
 /**
+ * Cooperative tool-call deadline, enforced by the harness' timeout policy
+ * through `exec.signal`. Mirrors `SEARCH_TIMEOUT_MS` in the tool this plugin
+ * shadows (`@deepseek-ai/dsh-tool-fs-search`).
+ */
+export const TGREP_TIMEOUT_MS = 30_000
+
+/** Byte budget for one serialized `presentationMeta` payload (mirrors `SEARCH_META_MAX_BYTES`). */
+export const MAX_META_BYTES = 65_536
+
+/** Per-line preview budget inside `presentationMeta` (mirrors `GREP_MAX_LINE_BYTES`). */
+export const META_LINE_MAX_BYTES = 2000
+
+/**
  * Standard Schema v1 validator for Cordis plugin configuration.
  */
 export const Config = {
@@ -142,6 +155,90 @@ function normalizeToolConfig(cfg) {
 }
 
 /**
+ * Serialized UTF-8 byte size of one meta payload, as persisted and re-sent.
+ */
+function metaBytes(meta) {
+  return Buffer.byteLength(JSON.stringify(meta), 'utf8')
+}
+
+/**
+ * Bound one matched line to `maxBytes` on a code-point boundary, marking the
+ * cut with an ellipsis. Keeps `presentationMeta` small for minified files
+ * without ever emitting a lone surrogate half.
+ */
+export function previewLine(line, maxBytes = META_LINE_MAX_BYTES) {
+  if (typeof line !== 'string') return ''
+  if (Buffer.byteLength(line, 'utf8') <= maxBytes) return line
+  const ellipsis = '…'
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(ellipsis, 'utf8'))
+  let out = ''
+  let bytes = 0
+  for (const char of line) {
+    const size = Buffer.byteLength(char, 'utf8')
+    if (bytes + size > budget) break
+    out += char
+    bytes += size
+  }
+  return `${out}${ellipsis}`
+}
+
+/**
+ * Drop trailing file groups until the serialized meta fits `maxMetaBytes`,
+ * flipping `truncated` when anything was dropped. `total` is preserved: it
+ * counts what the search FOUND, not what the card retains. A single group too
+ * large to fit alone is kept, so a bounded payload never becomes an empty card
+ * that hides a real result.
+ */
+export function capSearchMeta(meta, maxMetaBytes = MAX_META_BYTES) {
+  if (metaBytes(meta) <= maxMetaBytes) return meta
+  const files = [...meta.files]
+  while (files.length > 1 && metaBytes({ ...meta, files, truncated: true }) > maxMetaBytes) files.pop()
+  return { ...meta, files, truncated: true }
+}
+
+/**
+ * Narrow arbitrary replayed metadata into the search-card `files` payload.
+ * `presentationMeta` round-trips through the session log, so this runs on
+ * obsolete or hand-edited data and must reject rather than throw.
+ */
+function narrowSearchFiles(value) {
+  if (!Array.isArray(value)) return undefined
+  const files = []
+  for (const file of value) {
+    if (typeof file !== 'object' || file === null || Array.isArray(file)) return undefined
+    const { path, matches } = file
+    if (typeof path !== 'string' || !Array.isArray(matches)) return undefined
+    const narrowed = []
+    for (const match of matches) {
+      if (typeof match !== 'object' || match === null || Array.isArray(match)) return undefined
+      const { lineNumber, line } = match
+      if (!Number.isInteger(lineNumber) || lineNumber < 1 || typeof line !== 'string') return undefined
+      narrowed.push({ lineNumber, line })
+    }
+    files.push({ path, matches: narrowed })
+  }
+  return files
+}
+
+/**
+ * Project the retained matches into the `SearchMeta` the search card consumes,
+ * with per-line previews and a serialized-size cap.
+ */
+function grepSearchMeta(matches, maxMatches) {
+  const retained = matches.slice(0, maxMatches).map(match => ({
+    path: match.path,
+    lineNumber: match.lineNumber,
+    line: previewLine(match.line),
+  }))
+  return capSearchMeta({
+    shape: 'matches',
+    files: groupMatchesByFile(retained),
+    truncated: matches.length > maxMatches,
+    total: matches.length,
+  })
+}
+
+/**
  * Construct the model-facing `grep` ToolDefinition.
  *
  * Returns a plain object conforming to the harness `ToolDefinition` contract.
@@ -155,8 +252,10 @@ export function createGrepTool(cfg) {
     name: 'grep',
     description:
       'Search file contents with Microsoft tgrep (trigram index). ' +
-      'Returns matching lines with line numbers, grouped by file. ' +
-      'Use path to limit the search tree, or include to filter file names.',
+      'Returns matching lines with line numbers, grouped by file, capped at the configured limit. ' +
+      'Use path to limit the search tree, or include to filter file names. ' +
+      'Also accepts case_insensitive (case-insensitive match) and max_results (per-call cap).',
+    timeoutMs: TGREP_TIMEOUT_MS,
     parameters: {
       type: 'object',
       properties: {
@@ -214,13 +313,31 @@ export function createGrepTool(cfg) {
       presentationMeta: (args, value) => {
         const matches = value?.matches ?? []
         const maxMatches = clamp(Number(args?.max_results) || maxLines, 20, 5000)
-        return {
-          shape: 'matches',
-          files: groupMatchesByFile(matches.slice(0, maxMatches)),
-          truncated: matches.length > maxMatches,
-          total: matches.length,
-        }
+        return grepSearchMeta(matches, maxMatches)
       },
+    },
+    /** Pending-state card: a generic card titled like the tool it shadows. */
+    presentCall: (args) => {
+      const pattern = typeof args?.pattern === 'string' ? args.pattern : ''
+      const where = typeof args?.path === 'string' && args.path !== '' ? ` in ${args.path}` : ''
+      const filter = typeof args?.include === 'string' && args.include !== '' ? ` (${args.include})` : ''
+      return { card: 'generic', title: `Grep ${pattern}${where}${filter}`, kind: 'search', rawInput: pattern }
+    },
+    /**
+     * Completed-state card, reconstructed from the persisted metadata. Replay of
+     * an obsolete or hand-edited log must degrade to the generic card, so every
+     * shape check rejects instead of throwing.
+     */
+    presentResult: (_args, result) => {
+      if (result?.isError) return undefined
+      const meta = result?.meta
+      if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return undefined
+      if (meta.shape !== 'matches') return undefined
+      if (typeof meta.truncated !== 'boolean') return undefined
+      if (!Number.isInteger(meta.total) || meta.total < 0) return undefined
+      const files = narrowSearchFiles(meta.files)
+      if (files === undefined) return undefined
+      return { card: 'search', shape: 'matches', files, truncated: meta.truncated, total: meta.total }
     },
     async execute(args, exec) {
       if (!args || typeof args !== 'object') {

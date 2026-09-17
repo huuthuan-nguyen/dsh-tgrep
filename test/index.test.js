@@ -2,11 +2,14 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   Config,
+  MAX_META_BYTES,
+  TGREP_TIMEOUT_MS,
   apply,
   clamp,
   createGrepTool,
   formatGrepMatches,
   groupMatchesByFile,
+  previewLine,
   toRelativePath,
   validateInclude,
 } from '../index.js'
@@ -66,6 +69,82 @@ describe('createGrepTool schema and definition', () => {
         }
       })
     }
+  })
+})
+
+describe('grep timeout, metadata cap and card presenters', () => {
+  const tool = createGrepTool({ maxLines: 300 })
+
+  it('declares the cooperative timeout the harness policy enforces', () => {
+    assert.equal(TGREP_TIMEOUT_MS, 30_000)
+    assert.equal(tool.timeoutMs, TGREP_TIMEOUT_MS)
+  })
+
+  it('bounds the serialized presentationMeta while reporting the found total', () => {
+    const matches = Array.from({ length: 3000 }, (_, index) => ({
+      path: `src/file-${index}.ts`,
+      lineNumber: index + 1,
+      line: 'x'.repeat(4000),
+    }))
+    const meta = tool.output.presentationMeta({}, { matches })
+    assert.equal(meta.shape, 'matches')
+    assert.ok(Buffer.byteLength(JSON.stringify(meta), 'utf8') <= MAX_META_BYTES)
+    assert.equal(meta.truncated, true)
+    assert.equal(meta.total, 3000)
+    assert.ok(meta.files.length >= 1, 'a bounded meta never becomes an empty card')
+  })
+
+  it('leaves a small result untouched and uncapped', () => {
+    const matches = [{ path: 'a.ts', lineNumber: 1, line: 'short' }]
+    const meta = tool.output.presentationMeta({}, { matches })
+    assert.deepEqual(meta, {
+      shape: 'matches',
+      files: [{ path: 'a.ts', matches: [{ lineNumber: 1, line: 'short' }] }],
+      truncated: false,
+      total: 1,
+    })
+  })
+
+  it('previews long lines on a code-point boundary', () => {
+    const preview = previewLine(`head${'😀'.repeat(500)}`, 64)
+    assert.ok(Buffer.byteLength(preview, 'utf8') <= 64)
+    assert.ok(preview.startsWith('head'))
+    assert.ok(preview.endsWith('…'))
+    assert.equal(previewLine('short', 64), 'short')
+    assert.equal(previewLine(undefined, 64), '')
+  })
+
+  it('titles the pending call like the tool it shadows', () => {
+    assert.deepEqual(tool.presentCall({ pattern: 'foo', path: 'src', include: '*.ts' }), {
+      card: 'generic',
+      title: 'Grep foo in src (*.ts)',
+      kind: 'search',
+      rawInput: 'foo',
+    })
+    assert.equal(tool.presentCall({}).title, 'Grep ')
+  })
+
+  it('rebuilds the settled search card from persisted metadata', () => {
+    const meta = {
+      shape: 'matches',
+      files: [{ path: 'a.ts', matches: [{ lineNumber: 3, line: 'x' }] }],
+      truncated: false,
+      total: 1,
+    }
+    assert.deepEqual(tool.presentResult({}, { meta }), { card: 'search', ...meta })
+  })
+
+  it('degrades to the generic card on absent, errored or malformed metadata', () => {
+    const base = { shape: 'matches', files: [], truncated: false, total: 0 }
+    assert.equal(tool.presentResult({}, { meta: base, isError: true }), undefined)
+    assert.equal(tool.presentResult({}, {}), undefined)
+    assert.equal(tool.presentResult({}, { meta: null }), undefined)
+    assert.equal(tool.presentResult({}, { meta: [] }), undefined)
+    assert.equal(tool.presentResult({}, { meta: { ...base, shape: 'paths' } }), undefined)
+    assert.equal(tool.presentResult({}, { meta: { ...base, truncated: 'yes' } }), undefined)
+    assert.equal(tool.presentResult({}, { meta: { ...base, total: -1 } }), undefined)
+    assert.equal(tool.presentResult({}, { meta: { ...base, files: [{}] } }), undefined)
+    assert.equal(tool.presentResult({}, { meta: { ...base, files: [{ path: 'a.ts', matches: [{ lineNumber: 0, line: 'x' }] }] } }), undefined)
   })
 })
 

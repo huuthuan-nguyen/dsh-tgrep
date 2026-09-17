@@ -18,6 +18,25 @@ Provides orders-of-magnitude faster code searches on medium-to-large repositorie
 - **PTC & agent-plane shadowing**: Scoped to each agent so it cleanly replaces built-in ripgrep without modifying stock system presets.
 - **Safe parameter handling**: Immune to CLI flag injection (`--regexp` and `--` boundaries); supports regex, `include` glob filters, and case-insensitive flags.
 - **Zero build steps**: Pure modern ESM JavaScript — installs and runs directly without compiling.
+- **Zero runtime dependencies**: Never imports harness internals; the tool contract is plain JSON Schema.
+
+---
+
+## Tool Contract
+
+`dsh-tgrep` shadows `grep` on the agent plane, so the model sees this contract instead of the
+stock ripgrep one:
+
+| Field | Value |
+|---|---|
+| `parameters` | `pattern` (required), `path`, `include`, `case_insensitive`, `max_results` |
+| `timeoutMs` | `30000` — enforced by the harness tool-call timeout policy through `exec.signal` |
+| `presentationMeta` | `SearchMeta` (`shape: 'matches'`) with per-line previews, capped at 64 KiB |
+| `presentCall` / `presentResult` | Generic search call card + native search result card |
+
+`case_insensitive` and `max_results` are extensions over the stock tool. Unlike the stock tool,
+which spills an over-cap result to a workspace file, `dsh-tgrep` reports a truncation note
+inline and never writes a recovery file.
 
 ---
 
@@ -60,7 +79,7 @@ You can also install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.2
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.3
 ```
 
 ### Method 3: From Local Checkout (For development/contributors)
@@ -134,24 +153,45 @@ dsh plugin --profile web remove dsh-tgrep
 
 ### `Cannot read properties of undefined (reading 'prepare')`
 
-On DeepSeek Harness `v0.1.6-alpha.2` and newer, `resolutionMode` defaults to `runtime`,
-which loads the harness from its compiled `lib/` artifacts. Versions `0.1.1` and older
-imported `@deepseek-ai/dsh-tools` at runtime, which could evaluate a **second copy** of that
-package (`src/` next to `lib/`). Because DSH keys its internal tool scheduler with a private
-`Symbol()` (not `Symbol.for()`), the duplicated module produced a different symbol and
-`ctx.tools[TOOL_RUNTIME_SCHEDULER]` became `undefined`, aborting every turn that called `grep`.
+**This is a DeepSeek Harness defect, not a `dsh-tgrep` defect.** It was verified on a profile
+with **zero plugins installed**: every tool call (`bash`, `read`, `grep`, …) aborted the turn.
 
-Starting with `0.1.2`, `dsh-tgrep` is **zero-dependency**: it never imports harness internals,
-declares its tool parameters as plain standard JSON Schema, and therefore works identically in
-both `link` and `runtime` resolution modes. No action is needed beyond upgrading:
+Root cause, in the harness:
+
+- `packages/core/agent-loop/src/tool-calls.ts` reaches into the tool registry with
+  `ctx.tools[TOOL_RUNTIME_SCHEDULER].prepare(call.exec)` and never checks the result.
+- `TOOL_RUNTIME_SCHEDULER` is declared with `Symbol(...)` (`packages/core/tools/src/index.ts`),
+  not `Symbol.for(...)`, so the key is **private to one module instance**.
+- Harness `v0.1.6-alpha.2` changed the default `resolutionMode` from `link` to `runtime`
+  (`apps/cli/src/profile-boot.ts`). When `@deepseek-ai/dsh-tools` is reachable through two
+  resolution paths (the workspace copy and the profile install anchor's symlink), Node
+  evaluates it twice, the two symbols differ, the lookup yields `undefined`, and the cryptic
+  `Cannot read properties of undefined (reading 'prepare')` aborts every tool call.
+
+Workarounds until the harness ships a fix:
 
 ```bash
-dsh plugin --profile web remove dsh-tgrep
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.2
+# 1. One-line local harness patch, then rebuild the host libraries:
+#    packages/core/tools/src/index.ts
+#    - export const TOOL_RUNTIME_SCHEDULER: unique symbol = Symbol('@deepseek-ai/dsh-tools.scheduler')
+#    + export const TOOL_RUNTIME_SCHEDULER: unique symbol = Symbol.for('@deepseek-ai/dsh-tools.scheduler')
+pnpm run build:lib:host
+
+# 2. Or pin a harness release without the changed default:
+#    dsh-v0.1.6-alpha.1
+
+# 3. Or force the previous resolution mode, if your CLI exposes it:
+dsh --help | grep -i resolution
 ```
 
-If a turn still fails with that message while another third-party plugin is installed, that
-plugin most likely performs the same forbidden runtime import of `@deepseek-ai/dsh-tools`.
+### Why `dsh-tgrep` does not import harness internals
+
+Since `0.1.2` the plugin is **zero-dependency by design**: it never imports
+`@deepseek-ai/dsh-tools` (or any other harness package), and declares its tool contract as
+plain JSON Schema. Third-party plugins should not load harness internals at runtime — doing so
+can add yet another evaluated copy of the package and, with a private symbol key, break the
+host's own lookups. The plugin's contract with the harness is exactly the object passed to
+`tools.register()`.
 
 ---
 
