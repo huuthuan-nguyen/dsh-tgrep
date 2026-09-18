@@ -36,6 +36,13 @@ export const INDEX_DIR_NAME = '.tgrep'
 /** Default budget for an auto-started daemon to bind, before the search proceeds anyway. */
 export const DAEMON_READY_TIMEOUT_MS = 5000
 
+/**
+ * Default idle budget for a daemon this plugin started: stop it after 30 minutes without a
+ * search, so a long harness session does not accumulate one server per project visited.
+ * `tgrep serve` has no idle flag of its own, so the plugin owns this deadline. 0 disables it.
+ */
+export const DAEMON_IDLE_TIMEOUT_MS = 30 * 60 * 1000
+
 /** How often the readiness probe re-reads the server record while waiting. */
 const DAEMON_POLL_INTERVAL_MS = 250
 
@@ -126,6 +133,12 @@ function delay(ms) {
   return new Promise(resolve => { setTimeout(resolve, ms) })
 }
 
+/** The pid/port an auto-start reported, when a server record exists to read them from. */
+function serveRecordFacts(indexDir) {
+  const record = readServeRecord(indexDir)
+  return record === undefined ? {} : { pid: record.pid, port: record.port }
+}
+
 /** Pids this process owns, for diagnostics and tests. */
 export function ownedDaemonPids() {
   return [...ownedDaemons.values()]
@@ -143,17 +156,85 @@ export function ownedDaemonPids() {
  */
 export function stopOwnedDaemons() {
   const stopped = []
-  for (const [root, pid] of ownedDaemons) {
-    const record = readServeRecord(join(root, INDEX_DIR_NAME))
-    if (record?.pid === pid) {
-      try {
-        process.kill(pid, 'SIGTERM')
-        stopped.push(pid)
-      } catch { /* already gone */ }
-    }
+  for (const root of [...ownedDaemons.keys()]) {
+    const pid = stopOwnedDaemon(root)
+    if (pid !== undefined) stopped.push(pid)
   }
-  ownedDaemons.clear()
   return stopped
+}
+
+/**
+ * Stop one owned daemon. The recorded pid is signalled only while the root's server record still
+ * names it, so a daemon that exited on its own — and whose pid the OS may have recycled — is
+ * never mistaken for ours.
+ *
+ * @param root - absolute workspace root.
+ * @returns the pid that was signalled, or undefined when there was nothing safe to stop.
+ */
+export function stopOwnedDaemon(root) {
+  const pid = ownedDaemons.get(root)
+  if (pid === undefined) return undefined
+  ownedDaemons.delete(root)
+  if (readServeRecord(join(root, INDEX_DIR_NAME))?.pid !== pid) return undefined
+  try {
+    process.kill(pid, 'SIGTERM')
+    return pid
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether `tgrep` has published a complete index for this root. It writes `meta.json` as the
+ * build finishes, so a missing or incomplete record means indexing is still running.
+ */
+export function indexIsComplete(root) {
+  try {
+    return JSON.parse(readFileSync(join(root, INDEX_DIR_NAME, 'meta.json'), 'utf8'))?.complete === true
+  } catch {
+    return false
+  }
+}
+
+/** One pending idle timer per root, so activity can push the deadline back. */
+const idleTimers = new Map()
+
+/**
+ * Arm (or re-arm) the idle deadline for a daemon this process owns.
+ *
+ * `tgrep serve` has no idle flag, so the budget lives here, in the harness process: every search
+ * through the plugin counts as activity, exactly as client contact does in the dsh-knowcode
+ * reference. The timer is unref'd so waiting on it never keeps the harness alive.
+ *
+ * @param root - absolute workspace root.
+ * @param idleTimeoutMs - idle budget; 0 or less disables the deadline.
+ * @param logger - optional sink for the stop notice.
+ */
+export function armIdleTimer(root, idleTimeoutMs, logger) {
+  if (!(idleTimeoutMs > 0)) return
+  if (!ownedDaemons.has(root)) return
+  const existing = idleTimers.get(root)
+  if (existing !== undefined) clearTimeout(existing)
+  const timer = setTimeout(() => {
+    idleTimers.delete(root)
+    expireIdleDaemon(root, idleTimeoutMs, logger)
+  }, idleTimeoutMs)
+  timer.unref?.()
+  idleTimers.set(root, timer)
+}
+
+/** Stop an owned daemon that has been idle for its full budget; re-arm while it is indexing. */
+function expireIdleDaemon(root, idleTimeoutMs, logger) {
+  if (!ownedDaemons.has(root)) return
+  // Never stop mid-index: the run is real work, not idleness.
+  if (!indexIsComplete(root)) {
+    armIdleTimer(root, idleTimeoutMs, logger)
+    return
+  }
+  const pid = stopOwnedDaemon(root)
+  if (pid !== undefined) {
+    logger?.debug?.(`[dsh-tgrep] stopped idle daemon for ${root} (pid ${pid}) after ${idleTimeoutMs}ms`)
+  }
 }
 
 /**
@@ -176,7 +257,7 @@ export async function ensureDaemonStarted(workdir, options = {}) {
   const root = resolve(workdir)
   const indexDir = join(root, INDEX_DIR_NAME)
 
-  if (daemonAlive(indexDir)) return { started: true, spawned: false }
+  if (daemonAlive(indexDir)) return { started: true, spawned: false, ...serveRecordFacts(indexDir) }
 
   const inFlight = daemonAttempts.get(root)
   if (inFlight !== undefined) return inFlight
@@ -226,14 +307,16 @@ async function spawnDaemon(root, indexDir, options) {
 
     const deadline = Date.now() + readyTimeoutMs
     while (Date.now() < deadline) {
-      if (claimOwnership(root, indexDir, child.pid)) return { started: true, spawned: true }
+      if (claimOwnership(root, indexDir, child.pid)) {
+        return { started: true, spawned: true, ...serveRecordFacts(indexDir) }
+      }
       if (spawnError !== null) break
       if (exitedAt !== null && Date.now() - exitedAt > DAEMON_RACE_GRACE_MS) break
       await delay(DAEMON_POLL_INTERVAL_MS)
     }
 
     // A server that appeared during the wait is what this call wanted, whoever spawned it.
-    if (daemonAlive(indexDir)) return { started: true, spawned: false }
+    if (daemonAlive(indexDir)) return { started: true, spawned: false, ...serveRecordFacts(indexDir) }
     if (spawnError !== null) {
       return { started: false, spawned: false, reason: `failed to spawn tgrep serve: ${spawnError.message}` }
     }
@@ -326,6 +409,7 @@ export const Config = {
           autoStartDaemon: val.autoStartDaemon !== false,
           daemonReadyTimeoutMs: clamp(Number(val.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
           daemonArgs: Array.isArray(val.daemonArgs) ? val.daemonArgs.map(String) : [],
+          daemonIdleTimeoutMs: clamp(Number(val.daemonIdleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS) || 0, 0, 86_400_000),
           stopDaemonOnExit: val.stopDaemonOnExit !== false,
         },
       }
@@ -349,6 +433,7 @@ export function apply(ctx, config = {}) {
     autoStartDaemon: config.autoStartDaemon !== false,
     daemonReadyTimeoutMs: clamp(Number(config.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
     daemonArgs: Array.isArray(config.daemonArgs) ? config.daemonArgs.map(String) : [],
+    daemonIdleTimeoutMs: clamp(Number(config.daemonIdleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS) || 0, 0, 86_400_000),
     stopDaemonOnExit: config.stopDaemonOnExit !== false,
   }
 
@@ -357,7 +442,7 @@ export function apply(ctx, config = {}) {
     return
   }
 
-  const tool = createGrepTool(cfg)
+  const tool = createGrepTool(cfg, { logger: ctx.logger })
   const agentDisposers = new Map()
 
   function attachToAgent(agent) {
@@ -454,6 +539,9 @@ function normalizeToolConfig(cfg) {
     ),
     daemonArgs: Array.isArray(source.daemonArgs) ? source.daemonArgs.map(String) : [],
     stopDaemonOnExit: source.stopDaemonOnExit !== false,
+    daemonIdleTimeoutMs: clamp(
+      Number(source.daemonIdleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS) || 0, 0, 86_400_000,
+    ),
   }
 }
 
@@ -578,6 +666,26 @@ function narrowSearchFiles(value) {
 }
 
 /**
+ * The one-line notice a search carries when it started or failed to start a daemon.
+ *
+ * Mirrors the dsh-knowcode reference, which appends its auto-start note to the tool output:
+ * starting a background server is a side effect the user did not ask for, so it is stated once,
+ * on the call that caused it, rather than left to a log nobody reads.
+ */
+export function daemonAutoStartNote(daemon) {
+  if (daemon === null || typeof daemon !== 'object' || Array.isArray(daemon)) return undefined
+  if (daemon.started === false) {
+    return `> ⚙️ tgrep daemon auto-start failed: ${daemon.reason ?? 'unknown reason'}. `
+      + 'This search still ran by scanning.'
+  }
+  const where = typeof daemon.pid === 'number' ? ` (pid ${daemon.pid})` : ''
+  return daemon.indexing === true
+    ? `> ⚙️ tgrep daemon auto-started for this workspace${where} — its index is still building, so `
+      + 'this search scanned the tree instead (complete results, just slower). Later searches are index-served.'
+    : `> ⚙️ tgrep daemon auto-started for this workspace${where} — index ready, searches are index-served.`
+}
+
+/**
  * Project the retained matches into the `SearchMeta` the search card consumes,
  * with per-line previews and a serialized-size cap.
  */
@@ -603,10 +711,12 @@ function grepSearchMeta(matches, maxMatches) {
  * `@deepseek-ai/dsh-tools` itself can evaluate a second copy of that package,
  * and the private scheduler `Symbol()` then mismatches the host's.
  */
-export function createGrepTool(cfg) {
+export function createGrepTool(cfg, hooks = {}) {
   const {
     preferServer, maxLines, extraArgs, maxFileSize, autoStartDaemon, daemonReadyTimeoutMs, daemonArgs,
+    daemonIdleTimeoutMs,
   } = normalizeToolConfig(cfg)
+  const logger = hooks?.logger
   return {
     name: 'grep',
     description:
@@ -659,15 +769,16 @@ export function createGrepTool(cfg) {
               required: ['path', 'lineNumber', 'line'],
             },
           },
+          // Present only on the call that started (or failed to start) the workspace daemon.
+          daemon: { type: 'object', additionalProperties: true },
         },
         required: ['matches'],
       },
       render: (args, value) => {
         const maxMatches = clamp(Number(args?.max_results) || maxLines, 20, 5000)
-        return [{
-          type: 'text',
-          text: formatGrepMatches(value?.matches ?? [], maxMatches),
-        }]
+        const text = formatGrepMatches(value?.matches ?? [], maxMatches)
+        const note = daemonAutoStartNote(value?.daemon)
+        return [{ type: 'text', text: note === undefined ? text : `${text}\n\n${note}` }]
       },
       presentationMeta: (args, value) => {
         const matches = value?.matches ?? []
@@ -720,14 +831,28 @@ export function createGrepTool(cfg) {
       // search rooted at that same directory. Best-effort: a failure is logged, never thrown,
       // because the search below still answers by scanning.
       let indexPath
-      const workspaceIndex = join(workdir, INDEX_DIR_NAME)
+      let daemonFact
+      const workspaceRoot = resolve(workdir)
+      const workspaceIndex = join(workspaceRoot, INDEX_DIR_NAME)
       if (autoStartDaemon) {
-        const daemon = await ensureDaemonStarted(workdir, {
+        const daemon = await ensureDaemonStarted(workspaceRoot, {
           readyTimeoutMs: daemonReadyTimeoutMs,
           daemonArgs,
         })
+        if (daemon.started) {
+          // Any search counts as activity, so the idle deadline only fires when the workspace
+          // really goes quiet. A daemon we did not spawn is not ours to time out.
+          armIdleTimer(workspaceRoot, daemonIdleTimeoutMs, logger)
+        }
+        // Starting a background server is a side effect the user did not ask for: state it once,
+        // on the call that caused it. Reused daemons stay silent.
+        if (daemon.spawned || !daemon.started) {
+          daemonFact = daemon.started
+            ? { started: true, pid: daemon.pid, indexing: !indexIsComplete(workspaceRoot) }
+            : { started: false, reason: daemon.reason }
+        }
         if (!daemon.started && daemon.reason !== undefined) {
-          exec?.agent?.ctx?.logger?.warn?.(`[dsh-tgrep] ${daemon.reason}`)
+          logger?.warn?.(`[dsh-tgrep] ${daemon.reason}`)
         }
         if (existsSync(workspaceIndex)) indexPath = workspaceIndex
       }
@@ -749,7 +874,7 @@ export function createGrepTool(cfg) {
         maxMatches,
       })
 
-      return { matches }
+      return daemonFact === undefined ? { matches } : { matches, daemon: daemonFact }
     },
   }
 }

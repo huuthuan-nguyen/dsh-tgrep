@@ -23,6 +23,9 @@
         # Stop the daemon this plugin started when the harness exits, so it does
         # not linger as an orphan. Set false to keep it warm across sessions.
         stopDaemonOnExit: true
+        # Stop an idle daemon after this many milliseconds without a search
+        # (default 30 minutes; 0 disables). Every search resets the deadline.
+        daemonIdleTimeoutMs: 1800000
         # Extra flags for the `tgrep serve` daemon this plugin starts. `extraArgs`
         # above belongs to searches, so this is the only way to configure the
         # daemon itself. Examples:

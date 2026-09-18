@@ -179,7 +179,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.8
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.9
 ```
 
 ### Method 2: From the NPM Registry
@@ -235,6 +235,9 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
         # Stop the daemon this plugin started when the harness exits, so it does
         # not linger as an orphan. Set false to keep it warm across sessions.
         stopDaemonOnExit: true
+        # Stop an idle daemon after this many milliseconds without a search
+        # (default 30 minutes; 0 disables). Every search resets the deadline.
+        daemonIdleTimeoutMs: 1800000
         # Extra flags for the `tgrep serve` daemon. `extraArgs` above belongs to
         # searches, so this is the only way to configure the daemon itself.
         #   ["--exclude", "data"]                        skip a directory when indexing
@@ -259,6 +262,12 @@ one, detached, when it finds none:
   they scan the tree exactly as before, so the first call is correct and later calls are fast.
 - Its output goes to `<workspace>/.tgrep/serve.log`; the readiness record is
   `<workspace>/.tgrep/serve.json` (`{"pid":…,"port":…}`).
+- **Starting a daemon is announced, once.** The search that starts one carries a short note in
+  its result — `⚙️ tgrep daemon auto-started for this workspace (pid …)` — and says whether the
+  index was still building, meaning that search had to scan. Later searches on the same daemon
+  stay silent, and a failed start names its reason instead of leaving you guessing. The
+  [`dsh-knowcode`](https://github.com/huuthuan-nguyen/dsh-knowcode) reference does the same by
+  appending its auto-start note to the tool output.
 - **One daemon per workspace.** Concurrent calls share a single in-flight attempt, and a
   second caller that loses the race finds the winner's record instead of spawning again.
   Across *processes*, `tgrep serve` itself refuses a second server for one index directory
@@ -281,8 +290,6 @@ one, detached, when it finds none:
   **search** root, so without this a search limited to `src/` would scan even with the workspace
   server up. Pointed at a tree the index does not cover, `tgrep` falls back to scanning rather
   than answering wrongly.
-- A stale `serve.json` left by a killed daemon does not block a restart: the recorded pid is
-  probed, not trusted.
 - **The daemon is stopped when the harness exits.** It is spawned detached, so nothing else
   would end it: the plugin's disposal effect — which DSH runs on `SIGINT`/`SIGTERM` — sends
   `SIGTERM` to the daemons *it* started. A server you started yourself, or one belonging to
@@ -290,6 +297,13 @@ one, detached, when it finds none:
   search reuses it after a stale check rather than rebuilding.
 - Prefer to keep it warm across sessions? `stopDaemonOnExit: false` leaves it running. Note the
   plugin then never stops it, not even on a later exit — it is no longer "its" daemon.
+- **An idle daemon stops by itself.** `daemonIdleTimeoutMs` (default `1800000` — 30 minutes; `0`
+  disables it) ends the daemon after that long with no search through the plugin, so a long
+  harness session does not accumulate one server per project visited. Every search pushes the
+  deadline back, a daemon still building its index is never stopped mid-run, and only daemons
+  this plugin started are eligible — a server you launched by hand is left alone. `tgrep serve`
+  has no idle flag of its own, so the deadline lives in the plugin; that also means it cannot
+  fire after the harness is gone, which is what `stopDaemonOnExit` above covers.
 
 `tgrep` has no `stop` subcommand, so stopping a daemon means signalling its pid:
 

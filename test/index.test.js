@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test'
+import { afterEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   Config,
+  DAEMON_IDLE_TIMEOUT_MS,
   DAEMON_READY_TIMEOUT_MS,
   INDEX_DIR_NAME,
   MAX_META_BYTES,
@@ -15,10 +16,13 @@ import {
   buildTgrepArgs,
   clamp,
   createGrepTool,
+  armIdleTimer,
   daemonAlive,
+  daemonAutoStartNote,
   ensureDaemonStarted,
   formatGrepMatches,
   groupMatchesByFile,
+  indexIsComplete,
   isProcessAlive,
   normalizeMaxFileSize,
   ownedDaemonPids,
@@ -37,6 +41,13 @@ const tgrepAvailable = (() => {
     return false
   }
 })()
+
+/**
+ * Release every daemon this test file owns after each test. Ownership is process-wide state, so
+ * a test that only kills a pid by hand would leave a record that makes a later assertion about
+ * `ownedDaemonPids()` fail for an unrelated reason.
+ */
+afterEach(() => { stopOwnedDaemons() })
 
 /** Poll until `predicate` is true, or answer with its final value after `timeoutMs`. */
 async function waitFor(predicate, timeoutMs = 5000) {
@@ -206,6 +217,7 @@ describe('dsh-tgrep Config schema', () => {
       daemonReadyTimeoutMs: DAEMON_READY_TIMEOUT_MS,
       stopDaemonOnExit: true,
       daemonArgs: [],
+      daemonIdleTimeoutMs: DAEMON_IDLE_TIMEOUT_MS,
     })
   })
 
@@ -220,6 +232,7 @@ describe('dsh-tgrep Config schema', () => {
       daemonReadyTimeoutMs: 2500,
       stopDaemonOnExit: false,
       daemonArgs: ['--exclude', 'data'],
+      daemonIdleTimeoutMs: 60_000,
     })
     assert.deepEqual(res.value, {
       enabled: false,
@@ -231,6 +244,7 @@ describe('dsh-tgrep Config schema', () => {
       daemonReadyTimeoutMs: 2500,
       stopDaemonOnExit: false,
       daemonArgs: ['--exclude', 'data'],
+      daemonIdleTimeoutMs: 60_000,
     })
   })
 
@@ -815,6 +829,136 @@ describe('live daemon arguments', () => {
     } finally {
       if (pid !== undefined) {
         try { process.kill(pid) } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('daemon auto-start notice', () => {
+  it('states a start once, and says whether the search had to scan', () => {
+    const indexing = daemonAutoStartNote({ started: true, pid: 42, indexing: true })
+    assert.match(indexing, /auto-started for this workspace \(pid 42\)/)
+    assert.match(indexing, /scanned the tree instead/)
+    assert.match(indexing, /Later searches are index-served/)
+
+    const ready = daemonAutoStartNote({ started: true, pid: 42, indexing: false })
+    assert.match(ready, /index ready/)
+
+    const failed = daemonAutoStartNote({ started: false, reason: 'tgrep is missing' })
+    assert.match(failed, /auto-start failed: tgrep is missing/)
+    assert.match(failed, /still ran by scanning/)
+
+    for (const absent of [undefined, null, 'nope', [], 7]) {
+      assert.equal(daemonAutoStartNote(absent), undefined)
+    }
+  })
+
+  it('rides on the rendered content only when the value carries it', () => {
+    const tool = createGrepTool({ maxLines: 300 })
+    const matches = [{ path: 'a.ts', lineNumber: 1, line: 'hit' }]
+    const plain = tool.output.render({}, { matches })
+    assert.equal(plain[0].text.includes('auto-started'), false)
+
+    const noted = tool.output.render({}, { matches, daemon: { started: true, pid: 9, indexing: true } })
+    assert.match(noted[0].text, /a\.ts/)
+    assert.match(noted[0].text, /auto-started for this workspace \(pid 9\)/)
+  })
+
+  it('reports an incomplete index, which is what the note keys off', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-meta-'))
+    try {
+      assert.equal(indexIsComplete(root), false, 'no meta.json yet')
+      await mkdir(join(root, INDEX_DIR_NAME), { recursive: true })
+      await writeFile(join(root, INDEX_DIR_NAME, 'meta.json'), JSON.stringify({ complete: false }))
+      assert.equal(indexIsComplete(root), false)
+      await writeFile(join(root, INDEX_DIR_NAME, 'meta.json'), JSON.stringify({ complete: true }))
+      assert.equal(indexIsComplete(root), true)
+      await writeFile(join(root, INDEX_DIR_NAME, 'meta.json'), 'not json')
+      assert.equal(indexIsComplete(root), false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a non-positive idle budget as disabled', () => {
+    const defaults = Config['~standard'].validate({}).value
+    assert.equal(defaults.daemonIdleTimeoutMs, DAEMON_IDLE_TIMEOUT_MS)
+    assert.equal(Config['~standard'].validate({ daemonIdleTimeoutMs: 0 }).value.daemonIdleTimeoutMs, 0)
+    assert.equal(Config['~standard'].validate({ daemonIdleTimeoutMs: 60_000 }).value.daemonIdleTimeoutMs, 60_000)
+    assert.equal(Config['~standard'].validate({ daemonIdleTimeoutMs: 999_999_999 }).value.daemonIdleTimeoutMs, 86_400_000)
+    assert.doesNotThrow(() => armIdleTimer('/nowhere', 0))
+  })
+})
+
+describe('live daemon idle timeout', () => {
+  it('announces the first start and stays silent when reusing it', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-notice-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      const tool = createGrepTool({ maxLines: 300 })
+
+      const first = await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+      assert.equal(first.daemon?.started, true)
+      assert.ok(Number.isInteger(first.daemon.pid))
+      assert.match(daemonAutoStartNote(first.daemon), /auto-started/)
+
+      const second = await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+      assert.equal(second.daemon, undefined, 'a reused daemon is not announced again')
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('stops an idle daemon once its budget passes with no search', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-idle-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      const tool = createGrepTool({ maxLines: 300, daemonIdleTimeoutMs: 600 })
+
+      await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+      assert.equal(isProcessAlive(pid), true)
+
+      const stopped = await waitFor(() => !isProcessAlive(pid), 8000)
+      assert.ok(stopped, 'an idle daemon must stop on its own')
+      assert.deepEqual(ownedDaemonPids(), [], 'ownership is released with it')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already stopped */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('pushes the deadline back while searches keep arriving', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-touch-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      const tool = createGrepTool({ maxLines: 300, daemonIdleTimeoutMs: 1200 })
+
+      await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+      await new Promise(resolve => { setTimeout(resolve, 800) })
+      await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+
+      // 800 ms after the first search, so a non-resetting deadline would already be close;
+      // this asserts the second search restarted the clock rather than letting it lapse here.
+      await new Promise(resolve => { setTimeout(resolve, 600) })
+      assert.equal(isProcessAlive(pid), true, 'activity must postpone the stop')
+
+      const stopped = await waitFor(() => !isProcessAlive(pid), 8000)
+      assert.ok(stopped, 'and it still stops once activity ends')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already stopped */ }
       }
       await rm(root, { recursive: true, force: true })
     }
