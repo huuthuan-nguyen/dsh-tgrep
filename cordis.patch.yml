@@ -23,3 +23,11 @@
         # Stop the daemon this plugin started when the harness exits, so it does
         # not linger as an orphan. Set false to keep it warm across sessions.
         stopDaemonOnExit: true
+        # Extra flags for the `tgrep serve` daemon this plugin starts. `extraArgs`
+        # above belongs to searches, so this is the only way to configure the
+        # daemon itself. Examples:
+        #   ["--exclude", "data"]                        skip a directory when indexing
+        #   ["--watch-mode", "poll", "--poll-interval", "300"]  cheaper refresh
+        #   ["--no-watch"]                               index once, never refresh
+        #   ["--max-cpu", "25", "--max-memory", "2048"]  bound build resources
+        daemonArgs: []

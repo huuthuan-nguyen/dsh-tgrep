@@ -11,6 +11,7 @@ import {
   MAX_META_BYTES,
   TGREP_TIMEOUT_MS,
   apply,
+  buildServeArgs,
   buildTgrepArgs,
   clamp,
   createGrepTool,
@@ -204,6 +205,7 @@ describe('dsh-tgrep Config schema', () => {
       autoStartDaemon: true,
       daemonReadyTimeoutMs: DAEMON_READY_TIMEOUT_MS,
       stopDaemonOnExit: true,
+      daemonArgs: [],
     })
   })
 
@@ -217,6 +219,7 @@ describe('dsh-tgrep Config schema', () => {
       autoStartDaemon: false,
       daemonReadyTimeoutMs: 2500,
       stopDaemonOnExit: false,
+      daemonArgs: ['--exclude', 'data'],
     })
     assert.deepEqual(res.value, {
       enabled: false,
@@ -227,6 +230,7 @@ describe('dsh-tgrep Config schema', () => {
       autoStartDaemon: false,
       daemonReadyTimeoutMs: 2500,
       stopDaemonOnExit: false,
+      daemonArgs: ['--exclude', 'data'],
     })
   })
 
@@ -752,6 +756,62 @@ describe('one server per project', () => {
       assert.match(result.reason, /exited during startup/)
       assert.ok(elapsed < 4000, `gave up in ${elapsed}ms, not the full budget`)
       assert.equal(isProcessAlive(pid), true, 'the live server is untouched')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('daemon arguments', () => {
+  it('builds the serve argv, appending configured flags', () => {
+    assert.deepEqual(buildServeArgs('/w'), ['serve', '/w'])
+    assert.deepEqual(buildServeArgs('/w', []), ['serve', '/w'])
+    assert.deepEqual(
+      buildServeArgs('/w', ['--exclude', 'data', '--no-watch']),
+      ['serve', '/w', '--exclude', 'data', '--no-watch'],
+    )
+    // Replayed config may carry non-strings; they must not reach spawn() as objects.
+    assert.deepEqual(buildServeArgs('/w', [1, true]), ['serve', '/w', '1', 'true'])
+    assert.deepEqual(buildServeArgs('/w', 'not-an-array'), ['serve', '/w'])
+  })
+
+  it('keeps daemonArgs out of the search argv', () => {
+    const argv = buildTgrepArgs({ pattern: 'x', searchPath: '.', extraArgs: [], maxFileSize: null })
+    assert.ok(!argv.includes('--exclude'), 'search argv must stay free of daemon-only flags')
+  })
+})
+
+describe('live daemon arguments', () => {
+  it('honours an excluded directory in the index it builds', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-exclude-'))
+    let pid
+    try {
+      await mkdir(join(root, 'src'), { recursive: true })
+      await mkdir(join(root, 'data'), { recursive: true })
+      await writeFile(join(root, 'src', 'a.ts'), 'marker_included_src\n')
+      await writeFile(join(root, 'data', 'artifact.txt'), 'marker_excluded_data\n')
+
+      const started = await ensureDaemonStarted(root, { daemonArgs: ['--exclude', 'data'] })
+      assert.equal(started.spawned, true)
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+
+      // The daemon indexes in the background; searching before full coverage falls back to a
+      // scan, which would find the excluded file and make this test meaningless.
+      const indexed = await waitFor(async () => {
+        const status = spawnSync('tgrep', ['status', root], { encoding: 'utf8' })
+        return /Indexing:\s+complete/.test(status.stdout)
+      }, 15000)
+      assert.ok(indexed, 'the daemon must finish its first index')
+
+      const tool = createGrepTool({ maxLines: 300 })
+      const included = await tool.execute({ pattern: 'marker_included_src', path: root }, { cwd: root })
+      assert.equal(included.matches.length, 1)
+
+      const excluded = await tool.execute({ pattern: 'marker_excluded_data', path: root }, { cwd: root })
+      assert.equal(excluded.matches.length, 0, 'a directory excluded from indexing is not searched')
     } finally {
       if (pid !== undefined) {
         try { process.kill(pid) } catch { /* already gone */ }

@@ -107,6 +107,21 @@ const daemonAttempts = new Map()
  */
 const ownedDaemons = new Map()
 
+/**
+ * argv for one `tgrep serve`, after the executable name.
+ *
+ * The daemon is spawned by the plugin, so a user has no other way to pass it flags: `extraArgs`
+ * belongs to searches. `daemonArgs` covers the daemon's own knobs — `--exclude <dir>`,
+ * `--no-watch`, `--watch-mode poll`, `--max-cpu`, `--max-memory`.
+ *
+ * @param root - workspace root to serve.
+ * @param daemonArgs - extra arguments from the plugin config.
+ * @returns argv after the executable name.
+ */
+export function buildServeArgs(root, daemonArgs = []) {
+  return ['serve', root, ...(Array.isArray(daemonArgs) ? daemonArgs.map(String) : [])]
+}
+
 function delay(ms) {
   return new Promise(resolve => { setTimeout(resolve, ms) })
 }
@@ -189,7 +204,7 @@ async function spawnDaemon(root, indexDir, options) {
   }
 
   try {
-    const child = spawn('tgrep', ['serve', root], {
+    const child = spawn('tgrep', buildServeArgs(root, options.daemonArgs), {
       cwd: root,
       detached: true,
       // The daemon outlives this process, so it cannot share our stdio.
@@ -310,6 +325,7 @@ export const Config = {
           maxFileSize: normalizeMaxFileSize(val.maxFileSize),
           autoStartDaemon: val.autoStartDaemon !== false,
           daemonReadyTimeoutMs: clamp(Number(val.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
+          daemonArgs: Array.isArray(val.daemonArgs) ? val.daemonArgs.map(String) : [],
           stopDaemonOnExit: val.stopDaemonOnExit !== false,
         },
       }
@@ -332,6 +348,7 @@ export function apply(ctx, config = {}) {
     maxFileSize: normalizeMaxFileSize(config.maxFileSize),
     autoStartDaemon: config.autoStartDaemon !== false,
     daemonReadyTimeoutMs: clamp(Number(config.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
+    daemonArgs: Array.isArray(config.daemonArgs) ? config.daemonArgs.map(String) : [],
     stopDaemonOnExit: config.stopDaemonOnExit !== false,
   }
 
@@ -435,6 +452,7 @@ function normalizeToolConfig(cfg) {
     daemonReadyTimeoutMs: clamp(
       Number(source.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000,
     ),
+    daemonArgs: Array.isArray(source.daemonArgs) ? source.daemonArgs.map(String) : [],
     stopDaemonOnExit: source.stopDaemonOnExit !== false,
   }
 }
@@ -587,7 +605,7 @@ function grepSearchMeta(matches, maxMatches) {
  */
 export function createGrepTool(cfg) {
   const {
-    preferServer, maxLines, extraArgs, maxFileSize, autoStartDaemon, daemonReadyTimeoutMs,
+    preferServer, maxLines, extraArgs, maxFileSize, autoStartDaemon, daemonReadyTimeoutMs, daemonArgs,
   } = normalizeToolConfig(cfg)
   return {
     name: 'grep',
@@ -704,7 +722,10 @@ export function createGrepTool(cfg) {
       let indexPath
       const workspaceIndex = join(workdir, INDEX_DIR_NAME)
       if (autoStartDaemon) {
-        const daemon = await ensureDaemonStarted(workdir, { readyTimeoutMs: daemonReadyTimeoutMs })
+        const daemon = await ensureDaemonStarted(workdir, {
+          readyTimeoutMs: daemonReadyTimeoutMs,
+          daemonArgs,
+        })
         if (!daemon.started && daemon.reason !== undefined) {
           exec?.agent?.ctx?.logger?.warn?.(`[dsh-tgrep] ${daemon.reason}`)
         }

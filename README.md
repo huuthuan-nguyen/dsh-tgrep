@@ -179,7 +179,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.7
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.8
 ```
 
 ### Method 2: From the NPM Registry
@@ -235,6 +235,12 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
         # Stop the daemon this plugin started when the harness exits, so it does
         # not linger as an orphan. Set false to keep it warm across sessions.
         stopDaemonOnExit: true
+        # Extra flags for the `tgrep serve` daemon. `extraArgs` above belongs to
+        # searches, so this is the only way to configure the daemon itself.
+        #   ["--exclude", "data"]                        skip a directory when indexing
+        #   ["--watch-mode", "poll", "--poll-interval", "300"]  cheaper refresh
+        #   ["--no-watch"]                               index once, never refresh
+        daemonArgs: []
 ```
 
 ---
@@ -305,6 +311,65 @@ tgrep index .        # build the index once
 tgrep serve          # or keep a server running (auto-builds and watches)
 tgrep status .       # shows whether a server is running for this tree
 ```
+
+---
+
+## 🔍 What the Daemon Touches — and How to Verify It
+
+A common worry is that shadowing `grep` with an indexed daemon means your databases, build
+artifacts, and other large binaries are read on every search. They are not. Three independent
+layers stop a file before it is read:
+
+| Layer | Rule | How to check it on your project |
+|---|---|---|
+| **Ignore rules** | `.gitignore` (and `.git/info/exclude`, `.ignore`, `p4ignore.ini`) — applied only inside a git repository, as ripgrep does | `tgrep --files . \| grep -i '\.db'` → nothing |
+| **Binary extensions** | ~65 binary extensions are rejected during the walk, which ripgrep does not do | `tgrep count-files .` → `… (N binary skipped …)` |
+| **NUL-byte check** | the first 8 KB are inspected; a NUL byte makes the file binary | a real SQLite file with *no* ignore rules reports `0 files` searched |
+
+Measured on a real 103 MiB SQLite database copied to a directory with **no `.gitignore` at all**:
+
+```
+Brute-force search completed in 3.1ms (0 files): 0 matches
+```
+
+`0 files` means the walk rejected it **before** reading a single byte — and a search over that
+directory took 12 ms, exactly the same as a directory holding one small text file (that 12 ms is
+`tgrep` process startup, not I/O). Forcing `-a/--text` is the only way to make its contents
+searchable.
+
+**Anything else is bounded too**, and now configurable through `daemonArgs` (the daemon is
+started by the plugin, so this is the only way to pass it flags):
+
+```yaml
+config:
+  daemonArgs: ["--exclude", "data"]                      # never index this directory
+  # daemonArgs: ["--watch-mode", "poll", "--poll-interval", "300"]   # cheap refresh
+  # daemonArgs: ["--no-watch"]                           # index once, no refresh
+  # daemonArgs: ["--max-cpu", "25", "--max-memory", "2048"]  # bound build resources
+```
+
+Reach for these when a repository has heavy churn in ignored paths: on macOS `tgrep` keeps one
+recursive FSEvents watcher for the whole root and filters ignored events *after* delivery, so a
+process rewriting a database every second still costs the watcher per-event work. A poll-based
+or disabled watcher removes it.
+
+> Keep membership flags in step: `tgrep` compares the index against the filesystem at startup,
+> so an index built without `--exclude data` and served with it treats those files as deleted.
+> After changing `daemonArgs`, rebuild with the same flags — `rm -rf .tgrep` or
+> `tgrep index . --exclude data`. Do not pass `--index-path` here: the plugin pins the
+> workspace's own index for searches.
+
+### Inspecting a project's daemon
+
+```bash
+tgrep count-files .            # what the walk considers searchable
+tgrep --files . | head         # the exact file list it would search
+tgrep status .                 # index size, server pid/port, indexing progress
+tail -n 20 .tgrep/serve.log    # per-search timings: candidates, matches, elapsed
+```
+
+A healthy project's `serve.log` is quiet — a handful of `search:` lines and an occasional
+`stale check`, with no `overflow`, `fallback`, or `error` lines.
 
 ---
 
