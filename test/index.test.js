@@ -18,9 +18,12 @@ import {
   ensureDaemonStarted,
   formatGrepMatches,
   groupMatchesByFile,
+  isProcessAlive,
   normalizeMaxFileSize,
+  ownedDaemonPids,
   previewLine,
   readServeRecord,
+  stopOwnedDaemons,
   toRelativePath,
   validateInclude,
 } from '../index.js'
@@ -33,6 +36,16 @@ const tgrepAvailable = (() => {
     return false
   }
 })()
+
+/** Poll until `predicate` is true, or answer with its final value after `timeoutMs`. */
+async function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (await predicate()) return true
+    if (Date.now() >= deadline) return false
+    await new Promise(resolve => { setTimeout(resolve, 50) })
+  }
+}
 
 describe('createGrepTool schema and definition', () => {
   it('creates valid ToolDefinition with standard JSON Schema parameters', () => {
@@ -190,6 +203,7 @@ describe('dsh-tgrep Config schema', () => {
       maxFileSize: null,
       autoStartDaemon: true,
       daemonReadyTimeoutMs: DAEMON_READY_TIMEOUT_MS,
+      stopDaemonOnExit: true,
     })
   })
 
@@ -202,6 +216,7 @@ describe('dsh-tgrep Config schema', () => {
       maxFileSize: '8M',
       autoStartDaemon: false,
       daemonReadyTimeoutMs: 2500,
+      stopDaemonOnExit: false,
     })
     assert.deepEqual(res.value, {
       enabled: false,
@@ -211,6 +226,7 @@ describe('dsh-tgrep Config schema', () => {
       maxFileSize: '8M',
       autoStartDaemon: false,
       daemonReadyTimeoutMs: 2500,
+      stopDaemonOnExit: false,
     })
   })
 
@@ -562,6 +578,9 @@ describe('live daemon auto-start', () => {
       assert.deepEqual(result.matches.map(m => m.line), ['alpha two'])
     } finally {
       pid = readServeRecord(join(root, INDEX_DIR_NAME))?.pid ?? pid
+      // Stop through the plugin's own path so the ownership record is released too; a leaked
+      // record would look like a live daemon to later tests in this file.
+      stopOwnedDaemons()
       if (pid !== undefined) {
         try { process.kill(pid) } catch { /* already gone */ }
       }
@@ -578,6 +597,100 @@ describe('live daemon auto-start', () => {
       assert.equal(result.matches.length, 1)
       assert.equal(daemonAlive(join(root, INDEX_DIR_NAME)), false)
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('daemon shutdown ownership', () => {
+  it('defaults stopDaemonOnExit on and allows keeping the daemon warm', () => {
+    assert.equal(Config['~standard'].validate({}).value.stopDaemonOnExit, true)
+    assert.equal(Config['~standard'].validate({ stopDaemonOnExit: false }).value.stopDaemonOnExit, false)
+  })
+
+  it('releases ownership for everything it stopped', () => {
+    stopOwnedDaemons()
+    assert.deepEqual(ownedDaemonPids(), [])
+    assert.deepEqual(stopOwnedDaemons(), [], 'stopping twice is a no-op')
+  })
+
+  it('never signals a server another process started', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-foreign-'))
+    try {
+      // A record naming a live pid this plugin did not spawn — e.g. a user's own
+      // `tgrep serve`. The owner check must refuse to touch it.
+      await mkdir(join(root, INDEX_DIR_NAME), { recursive: true })
+      await writeFile(join(root, INDEX_DIR_NAME, 'serve.json'), JSON.stringify({ pid: process.pid, port: 1 }))
+      assert.deepEqual(stopOwnedDaemons(), [])
+      assert.equal(isProcessAlive(process.pid), true, 'the test process must survive')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('live daemon shutdown', () => {
+  it('stops the daemon it spawned when the plugin is disposed', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-exit-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      assert.equal((await ensureDaemonStarted(root)).spawned, true)
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+      assert.ok(ownedDaemonPids().includes(pid), 'a spawned daemon is owned')
+      assert.equal(isProcessAlive(pid), true)
+
+      // Dispose the plugin the way DSH does on shutdown; its effect must stop the daemon.
+      const disposers = []
+      const ctx = {
+        tools: { get: () => undefined, register: () => () => {} },
+        on: () => () => {},
+        agents: { list: () => [] },
+        effect: (fn) => { disposers.push(fn()) },
+      }
+      apply(ctx, {})
+      assert.ok(disposers.length > 0)
+      for (const dispose of disposers.reverse()) await dispose()
+
+      // The signal is sent synchronously, but `tgrep` finishes flushing its index before it
+      // exits, so the process takes a moment to disappear.
+      await waitFor(() => !isProcessAlive(pid))
+      assert.equal(daemonAlive(join(root, INDEX_DIR_NAME)), false, 'the daemon must be stopped')
+      assert.equal(isProcessAlive(pid), false)
+      assert.deepEqual(ownedDaemonPids(), [], 'ownership is released')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already stopped */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the daemon warm when stopDaemonOnExit is off', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-warm-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      await ensureDaemonStarted(root)
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+
+      const disposers = []
+      const ctx = {
+        tools: { get: () => undefined, register: () => () => {} },
+        on: () => () => {},
+        agents: { list: () => [] },
+        effect: (fn) => { disposers.push(fn()) },
+      }
+      apply(ctx, { stopDaemonOnExit: false })
+      for (const dispose of disposers.reverse()) await dispose()
+
+      // Give a would-be SIGTERM time to land before claiming the daemon survived.
+      await new Promise(resolve => { setTimeout(resolve, 500) })
+      assert.equal(isProcessAlive(pid), true, 'the warm daemon survives disposal')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already stopped */ }
+      }
       await rm(root, { recursive: true, force: true })
     }
   })

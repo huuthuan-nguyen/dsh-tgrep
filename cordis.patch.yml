@@ -20,3 +20,6 @@
         # How long a search waits for a freshly spawned daemon to bind before
         # proceeding anyway (it scans meanwhile, so the call never fails).
         daemonReadyTimeoutMs: 5000
+        # Stop the daemon this plugin started when the harness exits, so it does
+        # not linger as an orphan. Set false to keep it warm across sessions.
+        stopDaemonOnExit: true

@@ -95,8 +95,44 @@ export function daemonAlive(indexDir) {
 /** In-flight auto-start attempts, keyed by root: concurrent calls must share one spawn. */
 const daemonAttempts = new Map()
 
+/**
+ * Daemons THIS process spawned, keyed by root. Only these are ours to stop: a server the user
+ * started by hand, or another harness's, must survive us.
+ */
+const ownedDaemons = new Map()
+
 function delay(ms) {
   return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+/** Pids this process owns, for diagnostics and tests. */
+export function ownedDaemonPids() {
+  return [...ownedDaemons.values()]
+}
+
+/**
+ * Stop every daemon this process spawned. Called from the plugin's disposal effect, which DSH
+ * runs on shutdown: `runProfile` disposes the host fiber from its SIGINT/SIGTERM handler.
+ *
+ * A tracked pid is only signalled while the root's server record still names it, so a daemon
+ * that exited on its own — and whose pid the OS may have recycled — is never mistaken for ours.
+ * `tgrep` has no `stop` subcommand, so a signal is the only way to end one.
+ *
+ * @returns the pids that were signalled.
+ */
+export function stopOwnedDaemons() {
+  const stopped = []
+  for (const [root, pid] of ownedDaemons) {
+    const record = readServeRecord(join(root, INDEX_DIR_NAME))
+    if (record?.pid === pid) {
+      try {
+        process.kill(pid, 'SIGTERM')
+        stopped.push(pid)
+      } catch { /* already gone */ }
+    }
+  }
+  ownedDaemons.clear()
+  return stopped
 }
 
 /**
@@ -104,7 +140,8 @@ function delay(ms) {
  *
  * `tgrep` answers a search from its index only when one exists for the SEARCH root, so without
  * this a user had to run `tgrep serve .` in every project by hand. The daemon is spawned
- * detached so it outlives the harness, with its output appended to `<root>/.tgrep/serve.log`.
+ * detached so it outlives the harness, with its output appended to `<root>/.tgrep/serve.log`;
+ * that detach is also why the plugin stops the daemons it spawned on disposal.
  *
  * Best-effort by contract: a failure is reported, never thrown, because the search that follows
  * still works by scanning. `tgrep` itself refuses a second server for one index directory, so a
@@ -161,7 +198,7 @@ async function spawnDaemon(root, indexDir, options) {
 
     const deadline = Date.now() + readyTimeoutMs
     while (Date.now() < deadline) {
-      if (daemonAlive(indexDir)) return { started: true, spawned: true }
+      if (claimOwnership(root, indexDir, child.pid)) return { started: true, spawned: true }
       if (spawnError !== null) break
       await delay(DAEMON_POLL_INTERVAL_MS)
     }
@@ -181,6 +218,18 @@ async function spawnDaemon(root, indexDir, options) {
       try { closeSync(logFd) } catch { /* the child owns its own descriptor */ }
     }
   }
+}
+
+/**
+ * Record `root` as ours when the live server record names the child this process just spawned.
+ * A record naming any other pid belongs to a server someone else started, and is left alone.
+ */
+function claimOwnership(root, indexDir, childPid) {
+  if (childPid === undefined) return false
+  const record = readServeRecord(indexDir)
+  if (record === undefined || record.pid !== childPid || !isProcessAlive(record.pid)) return false
+  ownedDaemons.set(root, record.pid)
+  return true
 }
 
 /**
@@ -240,6 +289,7 @@ export const Config = {
           maxFileSize: normalizeMaxFileSize(val.maxFileSize),
           autoStartDaemon: val.autoStartDaemon !== false,
           daemonReadyTimeoutMs: clamp(Number(val.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
+          stopDaemonOnExit: val.stopDaemonOnExit !== false,
         },
       }
     },
@@ -261,6 +311,7 @@ export function apply(ctx, config = {}) {
     maxFileSize: normalizeMaxFileSize(config.maxFileSize),
     autoStartDaemon: config.autoStartDaemon !== false,
     daemonReadyTimeoutMs: clamp(Number(config.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
+    stopDaemonOnExit: config.stopDaemonOnExit !== false,
   }
 
   if (!cfg.enabled) {
@@ -324,13 +375,21 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // Clean up all registrations when the plugin is unloaded
+  // Clean up all registrations when the plugin is unloaded. DSH disposes the host fiber from
+  // its SIGINT/SIGTERM handler, so this also runs when the harness is shut down — which is
+  // where the daemons this plugin detached are stopped, since nothing else would.
   ctx.effect?.(() => () => {
     if (typeof stopCreated === 'function') {
       try { stopCreated() } catch { /* ignore */ }
     }
     if (typeof disposeHost === 'function') {
       try { disposeHost() } catch { /* ignore */ }
+    }
+    if (cfg.stopDaemonOnExit) {
+      const stopped = stopOwnedDaemons()
+      if (stopped.length > 0) {
+        ctx.logger?.debug?.(`[dsh-tgrep] stopped ${stopped.length} workspace daemon(s)`)
+      }
     }
     for (const cleanup of agentDisposers.values()) {
       try { cleanup() } catch { /* ignore */ }
@@ -355,6 +414,7 @@ function normalizeToolConfig(cfg) {
     daemonReadyTimeoutMs: clamp(
       Number(source.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000,
     ),
+    stopDaemonOnExit: source.stopDaemonOnExit !== false,
   }
 }
 

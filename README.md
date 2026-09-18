@@ -25,8 +25,9 @@ underneath:
    over an indexed tree return without re-walking every file (≈**15×** measured on a mid-size
    repo — see [⚡ Performance & Trade-offs](#-performance--trade-offs)).
 2. **Automatic daemon** — the workspace's `tgrep serve` is started for you on first use
-   (`autoStartDaemon`) and stays hot across calls and sessions, so there is no manual
-   `tgrep serve .` per project and no per-call cold start.
+   (`autoStartDaemon`) and stays hot across calls — and across sessions too if you keep it warm
+   with `stopDaemonOnExit: false`. No manual `tgrep serve .` per project, no per-call cold start,
+   and by default no orphan left behind when the harness exits.
 3. **Graceful degradation** — with no index and no daemon, `tgrep` scans files much like
    `grep` does today, so a fresh workspace still works.
 4. **Agent-plane shadowing** — the tool registers into each agent's own tool scope, so it
@@ -178,7 +179,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.5
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.6
 ```
 
 ### Method 2: From the NPM Registry
@@ -231,6 +232,9 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
         # How long a search waits for a freshly spawned daemon to bind before
         # proceeding anyway (it scans meanwhile, so the call never fails).
         daemonReadyTimeoutMs: 5000
+        # Stop the daemon this plugin started when the harness exits, so it does
+        # not linger as an orphan. Set false to keep it warm across sessions.
+        stopDaemonOnExit: true
 ```
 
 ---
@@ -257,6 +261,24 @@ one, detached, when it finds none:
   than answering wrongly.
 - A stale `serve.json` left by a killed daemon does not block a restart: the recorded pid is
   probed, not trusted.
+- **The daemon is stopped when the harness exits.** It is spawned detached, so nothing else
+  would end it: the plugin's disposal effect — which DSH runs on `SIGINT`/`SIGTERM` — sends
+  `SIGTERM` to the daemons *it* started. A server you started yourself, or one belonging to
+  another live harness, is never touched. The index stays on disk, so the next session's first
+  search reuses it after a stale check rather than rebuilding.
+- Prefer to keep it warm across sessions? `stopDaemonOnExit: false` leaves it running. Note the
+  plugin then never stops it, not even on a later exit — it is no longer "its" daemon.
+
+`tgrep` has no `stop` subcommand, so stopping a daemon means signalling its pid:
+
+```bash
+kill $(node -p "require('./.tgrep/serve.json').pid")
+```
+
+Two limits worth knowing: a harness killed with `SIGKILL` (or a crash) skips the disposal
+effect and leaves an orphan, which the next session adopts and reuses rather than killing; and
+daemons left behind by a version before `0.1.6` have no ownership record, so they must be
+stopped once by hand.
 
 Prefer to manage it yourself? Set `autoStartDaemon: false` — the plugin then touches no daemon
 and no index path. Doing it by hand stays available:
