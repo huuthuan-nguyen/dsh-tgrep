@@ -326,6 +326,28 @@ tgrep serve          # or keep a server running (auto-builds and watches)
 tgrep status .       # shows whether a server is running for this tree
 ```
 
+### Do I need to run `tgrep index`?
+
+No. **`tgrep serve` builds the index itself** when there is none — its own log says so:
+
+```
+[trace] no existing index found, will build in background
+[trace] bootstrapping index with the external merge sort (memory-bounded)...
+[trace] bootstrap complete: 1 files indexed in 0.0s (peak memory 12.0 MiB)
+```
+
+Because this plugin only ever spawns `serve` — never `index` — that build always uses the
+daemon's own flags, so the index/serve mismatch `tgrep` warns about cannot arise on its own.
+
+- A **search** never builds an index: without one it scans the tree, so searching never creates
+  a `.tgrep` behind your back.
+- `tgrep index .` remains useful deliberately — to pre-warm a large tree before a session, or to
+  rebuild after changing a membership flag in `daemonArgs` (`--exclude`, `--no-ignore*`,
+  `--max-filesize`). Rebuild with the same flags — `tgrep index . --exclude data`, or `rm -rf
+  .tgrep` — because a server treats an indexed file it cannot see as deleted.
+- While the first build runs, searches scan rather than return partial results, and
+  `tgrep status .` reports progress as `Indexing: …`.
+
 ---
 
 ## 🔍 What the Daemon Touches — and How to Verify It
@@ -440,6 +462,40 @@ pnpm run build:lib:host
 # 3. Or force the previous resolution mode, if your CLI exposes it:
 dsh --help | grep -i resolution
 ```
+
+### `skipping …: No such file or directory` and `Last reconcile error`
+
+`tgrep status .` can report:
+
+```
+Last reconcile error: reconciliation incomplete; see logs for filesystem or publication errors; will retry
+```
+
+while `serve.log` names a file that has already vanished:
+
+```
+tgrep: skipping /path/to/data/bot.db-shm: No such file or directory (os error 2)
+```
+
+This is a **benign race, not a stale index**. SQLite creates and removes its `-wal`/`-shm`
+companions — and editors their swap files — faster than the watcher can look at them, and on
+macOS `tgrep` keeps one recursive watcher for the whole root, so events for ignored paths are
+still delivered and filtered afterwards. Confirm the index is healthy instead of trusting the
+line: `tgrep status .` should show `Indexing: complete`, `Reconcile: idle`, and a recent
+`Last successful reconcile`, while `tgrep --files . | grep -i '\.db'` returns nothing.
+
+To cut the churn, stop the daemon reacting to every filesystem event:
+
+```yaml
+config:
+  daemonArgs: ["--watch-mode", "poll", "--poll-interval", "300"]   # one metadata pass every 5 min
+  # daemonArgs: ["--no-watch"]                                     # build once, never auto-refresh
+```
+
+`--exclude data` in `daemonArgs` is also worth setting for such a directory: it keeps those files
+out of the index walk entirely. Rebuild the index with the same flags afterwards.
+
+---
 
 ### Why `dsh-tgrep` does not import harness internals
 
