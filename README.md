@@ -22,7 +22,8 @@ searches. `dsh-tgrep` keeps the exact tool the model already knows and swaps the
 underneath:
 
 1. **Trigram index** — `tgrep` answers a query from its trigram index, so repeated searches
-   over an indexed tree return without re-walking every file.
+   over an indexed tree return without re-walking every file (≈**15×** measured on a mid-size
+   repo — see [⚡ Performance & Trade-offs](#-performance--trade-offs)).
 2. **Persistent daemon** — a running `tgrep serve` keeps the index hot across calls and
    sessions, with no per-call cold start.
 3. **Graceful degradation** — with no index and no daemon, `tgrep` scans files much like
@@ -44,9 +45,11 @@ underneath:
 | Feature | Stock `grep` (`dsh-tool-fs-search`) | **`dsh-tgrep`** |
 |---|---|---|
 | **Search engine** | Bundled ripgrep binary | **Microsoft `tgrep` (trigram index)** |
+| **Speed on an indexed repo** | O(bytes) per call — re-reads the tree | ✅ **Index-served (~15× measured; see [⚡ Performance](#-performance--trade-offs))** |
 | **Repeated queries** | Re-scans the tree on every call | ✅ **Index-served when indexed (scan fallback)** |
 | **Persistent daemon** | ❌ None | ✅ **`tgrep serve`** |
 | **Without an index** | ✅ Full scan | ✅ **Graceful fallback scan** |
+| **Files above 64 MiB** | ✅ Searched (no size cap) | ⚠️ **Skipped by default — silent missed matches** |
 | **Tool parameters** | `pattern`, `path`, `include` | ✅ Same **+ `case_insensitive`, `max_results`** |
 | **Cooperative timeout** | ✅ 30 000 ms | ✅ **30 000 ms (parity)** |
 | **Web GUI search card** | ✅ Native | ✅ **Native (`presentCall` / `presentResult` + `SearchMeta`)** |
@@ -56,6 +59,64 @@ underneath:
 | **Agent-plane shadowing** | Host registry entry | ✅ **Per-agent shadowing, presets untouched** |
 | **Runtime dependency** | Bundled ripgrep | ⚠️ **`tgrep` binary on `PATH`** |
 | **Build step** | Compiled with the harness | ✅ **None — plain ESM** |
+
+---
+
+## ⚡ Performance & Trade-offs
+
+`grep` and `ripgrep` scan every file on every search — **O(total bytes) per query**. `tgrep`
+pre-builds a trigram index so a search only touches the files that could match, and a running
+`tgrep serve` keeps that index hot. Microsoft publishes the full results in
+[`BENCHMARKS.md`](https://github.com/microsoft/tgrep/blob/main/BENCHMARKS.md) — up to **52×
+faster** than ripgrep on large repositories, winning 17 of the 18 measured cells (index
+pre-built, average latency per query):
+
+| Repo | Files | Platform | ripgrep | tgrep | Speedup |
+|---|---:|---|---:|---:|---:|
+| gecko-dev | 388 K | macOS arm64 | 33,402 ms | 643 ms | **51.9×** |
+| linux | 96 K | macOS arm64 | 5,390 ms | 256 ms | **21.0×** |
+| chromium | 504 K | macOS arm64 | 41,806 ms | 2,643 ms | **15.8×** |
+| rust | 62 K | Windows | 1,489 ms | 194 ms | **7.7×** |
+| kubernetes | 31 K | Windows | 1,342 ms | 190 ms | **7.1×** |
+
+Measured locally on this machine (macOS arm64, `deepseek-harness/packages`, 5,672 text files,
+160 MB, pattern `defineTool`, 226 matches, best of 3):
+
+| Mode | Latency |
+|---|---:|
+| `tgrep` with an index | **15 ms** |
+| `tgrep` with an index **+ `-g '*.ts'`** (what `include` sends) | **15 ms** |
+| `tgrep --no-index` (the brute-force scan `grep`/ripgrep always performs) | **232 ms** |
+
+So roughly **15× faster** on a mid-size repo, and building that index took **0.7 s**. Note that
+passing a positive `-g` glob filter — which the tool's `include` parameter does — keeps the
+index benefit rather than falling back to a scan.
+
+### When the margin shrinks — or reverses
+
+- **No index, no benefit.** Without a built index (or a running `tgrep serve`), `tgrep` scans
+  like ripgrep. The first search on a large tree is therefore not faster.
+- **Small repos and broad queries.** The margin depends on repo size and on how many matches a
+  query returns: a search returning tens of thousands of matches spends more on *delivering*
+  them than the index saves on *finding* them. On Kubernetes/Linux, Microsoft measured a
+  near-tie (0.93×).
+- **`preferServer: false`** in this plugin's config passes `--no-index`, deliberately choosing
+  the brute-force scan (useful when the index may be stale).
+- **Files above 64 MiB are skipped by default** — a deliberate divergence from ripgrep.
+  Verified here: a 74 MiB file reported no match until `--no-max-filesize` was passed. If your
+  workspace contains such files, add the flag through `extraArgs`:
+
+  ```yaml
+  config:
+    extraArgs: ["--no-max-filesize"]
+  ```
+
+- **Bigger flags fall back to a scan.** Widening flags (`-E/--encoding`, `-a/--text`,
+  `--binary`, the `--no-ignore*` family) bypass the index, so `extraArgs` using them gives up
+  the speedup — and a single named file is always read directly.
+
+Run `tgrep status .` to see whether a server/index is serving your tree, or `tgrep <pattern> .
+--stats` for the query plan and timing.
 
 ---
 
@@ -74,6 +135,10 @@ stock ripgrep one:
 `case_insensitive` and `max_results` are extensions over the stock tool. Unlike the stock tool,
 which spills an over-cap result to a workspace file, `dsh-tgrep` reports a truncation note
 inline and never writes a recovery file.
+
+⚠️ `tgrep` also **skips files larger than 64 MiB** by default, where ripgrep searches them. A
+match inside such a file is reported as no match — see
+[⚡ Performance & Trade-offs](#-performance--trade-offs) for the `--no-max-filesize` opt-out.
 
 ---
 
