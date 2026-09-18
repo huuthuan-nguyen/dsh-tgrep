@@ -49,7 +49,7 @@ underneath:
 | **Repeated queries** | Re-scans the tree on every call | ✅ **Index-served when indexed (scan fallback)** |
 | **Persistent daemon** | ❌ None | ✅ **`tgrep serve`** |
 | **Without an index** | ✅ Full scan | ✅ **Graceful fallback scan** |
-| **Files above 64 MiB** | ✅ Searched (no size cap) | ⚠️ **Skipped by default — silent missed matches** |
+| **Files above 64 MiB** | ✅ Searched (no size cap) | ✅ **Searched — uncapped by default (`maxFileSize` opts into a cap)** |
 | **Tool parameters** | `pattern`, `path`, `include` | ✅ Same **+ `case_insensitive`, `max_results`** |
 | **Cooperative timeout** | ✅ 30 000 ms | ✅ **30 000 ms (parity)** |
 | **Web GUI search card** | ✅ Native | ✅ **Native (`presentCall` / `presentResult` + `SearchMeta`)** |
@@ -102,13 +102,15 @@ index benefit rather than falling back to a scan.
   near-tie (0.93×).
 - **`preferServer: false`** in this plugin's config passes `--no-index`, deliberately choosing
   the brute-force scan (useful when the index may be stale).
-- **Files above 64 MiB are skipped by default** — a deliberate divergence from ripgrep.
-  Verified here: a 74 MiB file reported no match until `--no-max-filesize` was passed. If your
-  workspace contains such files, add the flag through `extraArgs`:
+- **Files above 64 MiB.** `tgrep` skips them by default, where ripgrep searches them — a
+  deliberate divergence. Verified here: a 74 MiB file reported no match until
+  `--no-max-filesize` was passed. Because silently dropping matches would break `grep`
+  semantics, **this plugin passes `--no-max-filesize` by default**. On a workspace dominated by
+  huge generated files that trade may cost scan time; opt back into a cap if you want it:
 
   ```yaml
   config:
-    extraArgs: ["--no-max-filesize"]
+    maxFileSize: "64M"   # or "8M", or a byte count
   ```
 
 - **Bigger flags fall back to a scan.** Widening flags (`-E/--encoding`, `-a/--text`,
@@ -136,9 +138,10 @@ stock ripgrep one:
 which spills an over-cap result to a workspace file, `dsh-tgrep` reports a truncation note
 inline and never writes a recovery file.
 
-⚠️ `tgrep` also **skips files larger than 64 MiB** by default, where ripgrep searches them. A
-match inside such a file is reported as no match — see
-[⚡ Performance & Trade-offs](#-performance--trade-offs) for the `--no-max-filesize` opt-out.
+⚠️ `tgrep` also **skips files larger than 64 MiB** by default, where ripgrep searches them. This
+plugin passes `--no-max-filesize` so shadowing `grep` cannot silently drop matches; set
+`maxFileSize` (e.g. `"64M"`) to opt into a cap instead — see
+[⚡ Performance & Trade-offs](#-performance--trade-offs).
 
 ---
 
@@ -214,6 +217,10 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
         maxLines: 300
         # Extra CLI flags passed to tgrep (e.g. ["--hidden"])
         extraArgs: []
+        # Files larger than this are skipped by tgrep. Omitted (the default)
+        # means --no-max-filesize, matching grep/ripgrep coverage; set a size
+        # such as "64M" or "8M" to cap instead.
+        # maxFileSize: "64M"
 ```
 
 ---

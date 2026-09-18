@@ -1,18 +1,33 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { mkdtemp, open, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   Config,
   MAX_META_BYTES,
   TGREP_TIMEOUT_MS,
   apply,
+  buildTgrepArgs,
   clamp,
   createGrepTool,
   formatGrepMatches,
   groupMatchesByFile,
+  normalizeMaxFileSize,
   previewLine,
   toRelativePath,
   validateInclude,
 } from '../index.js'
+
+/** Whether the `tgrep` binary is available, gating the live search tests. */
+const tgrepAvailable = (() => {
+  try {
+    return spawnSync('tgrep', ['--version'], { stdio: 'ignore' }).status === 0
+  } catch {
+    return false
+  }
+})()
 
 describe('createGrepTool schema and definition', () => {
   it('creates valid ToolDefinition with standard JSON Schema parameters', () => {
@@ -167,6 +182,7 @@ describe('dsh-tgrep Config schema', () => {
       preferServer: true,
       maxLines: 300,
       extraArgs: [],
+      maxFileSize: null,
     })
   })
 
@@ -176,12 +192,14 @@ describe('dsh-tgrep Config schema', () => {
       preferServer: false,
       maxLines: 500,
       extraArgs: ['--stats'],
+      maxFileSize: '8M',
     })
     assert.deepEqual(res.value, {
       enabled: false,
       preferServer: false,
       maxLines: 500,
       extraArgs: ['--stats'],
+      maxFileSize: '8M',
     })
   })
 
@@ -381,5 +399,77 @@ describe('apply lifecycle and agent shadowing', () => {
     ctx.unload()
     // The tool should be removed from the agent
     assert.equal(agent.ctx.tools.registered.has('grep'), false)
+  })
+})
+
+describe('file-size policy (grep parity)', () => {
+  it('uncaps file size by default so shadowing grep cannot drop matches', () => {
+    const argv = buildTgrepArgs({ pattern: 'x', searchPath: '.', extraArgs: [], maxFileSize: null })
+    assert.ok(argv.includes('--no-max-filesize'))
+    assert.ok(!argv.includes('--max-filesize'))
+  })
+
+  it('applies a configured cap instead of uncapping', () => {
+    const argv = buildTgrepArgs({ pattern: 'x', searchPath: '.', extraArgs: [], maxFileSize: '8M' })
+    assert.equal(argv[argv.indexOf('--max-filesize') + 1], '8M')
+    assert.ok(!argv.includes('--no-max-filesize'))
+  })
+
+  it('lets an explicit extraArgs size flag own the policy', () => {
+    for (const extraArgs of [['--no-max-filesize'], ['--max-filesize', '1M'], ['--max-filesize=2M']]) {
+      const argv = buildTgrepArgs({ pattern: 'x', searchPath: '.', extraArgs, maxFileSize: null })
+      const injected = argv.filter(a => a === '--no-max-filesize' || a === '--max-filesize')
+      assert.equal(injected.length, extraArgs.filter(a => a === '--no-max-filesize' || a === '--max-filesize').length)
+    }
+  })
+
+  it('keeps the injection-guard flags last', () => {
+    const argv = buildTgrepArgs({ pattern: 'a b', searchPath: 'src', extraArgs: [], maxFileSize: null })
+    assert.deepEqual(argv.slice(-3), ['--regexp=a b', '--', 'src'])
+  })
+
+  it('normalizes the maxFileSize config', () => {
+    assert.equal(normalizeMaxFileSize(undefined), null)
+    assert.equal(normalizeMaxFileSize(null), null)
+    assert.equal(normalizeMaxFileSize(''), null)
+    assert.equal(normalizeMaxFileSize('64M'), '64M')
+    assert.equal(normalizeMaxFileSize(' 8m '), '8m')
+    assert.equal(normalizeMaxFileSize(1024), '1024')
+    assert.deepEqual(Config['~standard'].validate({ maxFileSize: '16M' }).value.maxFileSize, '16M')
+    assert.deepEqual(Config['~standard'].validate({}).value.maxFileSize, null)
+  })
+
+  it('rejects an unusable maxFileSize instead of guessing', () => {
+    for (const bad of ['abc', '0', -1, 0, '1.2.3', true, {}]) {
+      assert.throws(() => normalizeMaxFileSize(bad), /maxFileSize must be a positive byte count/)
+    }
+  })
+})
+
+describe('live tgrep coverage above the default size cap', () => {
+  it('finds a match in a 65 MiB file, and misses it when capped', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tgrep-size-'))
+    const big = join(dir, 'big.log')
+    const marker = 'NEEDLE_ABOVE_THE_CAP'
+    try {
+      const line = 'filler line for the size policy test\n'
+      const unit = Buffer.from(line.repeat(Math.ceil((1024 * 1024) / line.length)))
+      const handle = await open(big, 'w')
+      try {
+        for (let written = 0; written < 65 * 1024 * 1024; written += unit.length) await handle.write(unit)
+        await handle.write(`${marker}\n`)
+      } finally {
+        await handle.close()
+      }
+
+      const uncapped = await createGrepTool({ maxLines: 300 }).execute({ pattern: marker, path: dir }, {})
+      assert.equal(uncapped.matches.length, 1)
+
+      const capped = await createGrepTool({ maxLines: 300, maxFileSize: '64M' })
+        .execute({ pattern: marker, path: dir }, {})
+      assert.equal(capped.matches.length, 0)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -9,3 +9,8 @@
         maxLines: 300
         # Extra CLI flags passed to every tgrep invocation (array of strings)
         extraArgs: []
+        # tgrep skips files above 64 MiB by default, where grep/ripgrep search
+        # them; this plugin passes --no-max-filesize so shadowing grep cannot
+        # silently drop matches. Set a size here to cap instead (e.g. "64M",
+        # "8M"), trading coverage for scan time on repos with huge files.
+        # maxFileSize: "64M"

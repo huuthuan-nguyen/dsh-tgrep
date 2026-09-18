@@ -30,6 +30,40 @@ export const MAX_META_BYTES = 65_536
 export const META_LINE_MAX_BYTES = 2000
 
 /**
+ * `tgrep` skips files above 64 MiB by default, where `grep`/ripgrep search them. This plugin
+ * therefore passes `--no-max-filesize` unless the config names a cap, so shadowing `grep`
+ * cannot silently drop matches.
+ */
+export const DEFAULT_MAX_FILE_SIZE = null
+
+/** One `--max-filesize` argument that came from user `extraArgs`, which own the decision. */
+function isMaxFileSizeFlag(argument) {
+  return /^--(?:no-)?max-filesize(?:=.*)?$/.test(argument)
+}
+
+/**
+ * Normalize the `maxFileSize` config into `null` (no cap) or a `tgrep` SIZE token.
+ * Accepts a positive byte count or a size with a `K`/`M`/`G` suffix (e.g. `"64M"`).
+ * @throws when a value is present but is not a usable size.
+ */
+export function normalizeMaxFileSize(raw) {
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_MAX_FILE_SIZE
+  const token = typeof raw === 'number'
+    ? (Number.isInteger(raw) && raw > 0 ? String(raw) : undefined)
+    : typeof raw === 'string' && /^[0-9]+(?:\.[0-9]+)?\s*[KMGkmg]?$/.test(raw.trim())
+      ? raw.trim()
+      : undefined
+  // A zero cap would skip every file, which is never what a caller means.
+  if (token === undefined || Number.parseFloat(token) <= 0) {
+    throw new Error(
+      'dsh-tgrep: maxFileSize must be a positive byte count or a size with a K/M/G suffix '
+      + `(e.g. "64M"), got ${JSON.stringify(raw)}`,
+    )
+  }
+  return token
+}
+
+/**
  * Standard Schema v1 validator for Cordis plugin configuration.
  */
 export const Config = {
@@ -44,6 +78,7 @@ export const Config = {
           preferServer: val.preferServer !== false,
           maxLines: clamp(Number(val.maxLines) || 300, 20, 5000),
           extraArgs: Array.isArray(val.extraArgs) ? val.extraArgs.map(String) : [],
+          maxFileSize: normalizeMaxFileSize(val.maxFileSize),
         },
       }
     },
@@ -62,6 +97,7 @@ export function apply(ctx, config = {}) {
     preferServer: config.preferServer !== false,
     maxLines: clamp(Number(config.maxLines) || 300, 20, 5000),
     extraArgs: Array.isArray(config.extraArgs) ? config.extraArgs.map(String) : [],
+    maxFileSize: normalizeMaxFileSize(config.maxFileSize),
   }
 
   if (!cfg.enabled) {
@@ -151,7 +187,54 @@ function normalizeToolConfig(cfg) {
     preferServer: source.preferServer !== false,
     maxLines: clamp(Number(source.maxLines) || 300, 20, 5000),
     extraArgs: Array.isArray(source.extraArgs) ? source.extraArgs.map(String) : [],
+    maxFileSize: normalizeMaxFileSize(source.maxFileSize),
   }
+}
+
+/**
+ * Build the exact `tgrep` argv for one call.
+ *
+ * The file-size policy is emitted here rather than by the caller: `tgrep` caps files at
+ * 64 MiB by default while `grep`/ripgrep search them, so shadowing `grep` requires the
+ * uncapped form unless the config names a cap. An explicit `--max-filesize` /
+ * `--no-max-filesize` in `extraArgs` wins, because the user wrote it deliberately.
+ *
+ * @param options - validated call facts and plugin config.
+ * @returns argv after the executable name.
+ */
+export function buildTgrepArgs(options) {
+  const {
+    pattern, searchPath, include, caseInsensitive, preferServer, extraArgs, maxFileSize,
+  } = options
+
+  const cliArgs = ['--json']
+
+  if (caseInsensitive) {
+    cliArgs.push('-i')
+  }
+
+  if (include) {
+    cliArgs.push('-g', String(include))
+  }
+
+  if (preferServer === false) {
+    cliArgs.push('--no-index')
+  }
+
+  for (const argument of extraArgs) {
+    cliArgs.push(argument)
+  }
+
+  if (!extraArgs.some(isMaxFileSizeFlag)) {
+    if (maxFileSize === null) cliArgs.push('--no-max-filesize')
+    else cliArgs.push('--max-filesize', maxFileSize)
+  }
+
+  // Safeguard: pattern and path passed with explicit flags to prevent flag injection
+  cliArgs.push(`--regexp=${pattern}`)
+  cliArgs.push('--', searchPath)
+
+  return cliArgs
 }
 
 /**
@@ -247,7 +330,7 @@ function grepSearchMeta(matches, maxMatches) {
  * and the private scheduler `Symbol()` then mismatches the host's.
  */
 export function createGrepTool(cfg) {
-  const { preferServer, maxLines, extraArgs } = normalizeToolConfig(cfg)
+  const { preferServer, maxLines, extraArgs, maxFileSize } = normalizeToolConfig(cfg)
   return {
     name: 'grep',
     description:
@@ -357,27 +440,15 @@ export function createGrepTool(cfg) {
       const workdir = resolveCwd(exec)
       const searchPath = args.path ? String(args.path) : '.'
 
-      const cliArgs = ['--json']
-
-      if (args.case_insensitive) {
-        cliArgs.push('-i')
-      }
-
-      if (args.include) {
-        cliArgs.push('-g', String(args.include))
-      }
-
-      if (preferServer === false) {
-        cliArgs.push('--no-index')
-      }
-
-      for (const a of extraArgs) {
-        cliArgs.push(a)
-      }
-
-      // Safeguard: pattern and path passed with explicit flags to prevent flag injection
-      cliArgs.push(`--regexp=${args.pattern}`)
-      cliArgs.push('--', searchPath)
+      const cliArgs = buildTgrepArgs({
+        pattern: args.pattern,
+        searchPath,
+        include: args.include ? String(args.include) : undefined,
+        caseInsensitive: Boolean(args.case_insensitive),
+        preferServer,
+        extraArgs,
+        maxFileSize,
+      })
 
       const matches = await runTgrep(cliArgs, {
         signal: exec?.signal,
