@@ -179,7 +179,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.6
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.7
 ```
 
 ### Method 2: From the NPM Registry
@@ -253,8 +253,24 @@ one, detached, when it finds none:
   they scan the tree exactly as before, so the first call is correct and later calls are fast.
 - Its output goes to `<workspace>/.tgrep/serve.log`; the readiness record is
   `<workspace>/.tgrep/serve.json` (`{"pid":…,"port":…}`).
-- One daemon per workspace: concurrent calls share a single attempt, and `tgrep` itself refuses
-  a second server for the same index directory, so a lost race still ends with one live server.
+- **One daemon per workspace.** Concurrent calls share a single in-flight attempt, and a
+  second caller that loses the race finds the winner's record instead of spawning again.
+  Across *processes*, `tgrep serve` itself refuses a second server for one index directory
+  ("another tgrep server is already running for index directory …"), so two harnesses starting
+  at the same instant still end with exactly one server — verified by racing two processes at
+  one project and counting the resulting `tgrep serve` processes. Unlike the
+  [`dsh-knowcode`](https://github.com/huuthuan-nguyen/dsh-knowcode) reference, this plugin ships
+  no lock file of its own: `tgrep` already owns that guard, and a second lock would be one more
+  file in the index directory for no added safety.
+- **No extra index artifacts.** The plugin creates the canonical `<workspace>/.tgrep` (where
+  `tgrep` puts its own index anyway) and adds exactly **one** file to it: `serve.log`. Nothing
+  else. Indexes are never built for a *search*: a search limited to `src/` reuses the workspace
+  index through the pinned `--index-path`, one pointed at a tree the index does not cover falls
+  back to scanning, and a search in an unrelated project creates nothing — all verified.
+- A stale `serve.json` left by a killed daemon does not block a restart: the recorded pid is
+  probed, not trusted. `tgrep` leaves its own `serve.json` and an empty `serve.lock` behind on
+  every exit — including a manual `kill` — and this plugin deliberately does not delete them,
+  since they are another tool's state and a restart works regardless.
 - Searches pass `--index-path <workspace>/.tgrep`. `tgrep` resolves its index relative to the
   **search** root, so without this a search limited to `src/` would scan even with the workspace
   server up. Pointed at a tree the index does not cover, `tgrep` falls back to scanning rather

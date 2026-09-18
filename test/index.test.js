@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -690,6 +690,71 @@ describe('live daemon shutdown', () => {
     } finally {
       if (pid !== undefined) {
         try { process.kill(pid) } catch { /* already stopped */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('one server per project', () => {
+  it('two processes racing to start leave exactly one daemon', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-race-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      const moduleUrl = new URL('../index.js', import.meta.url).href
+      const script = `import { ensureDaemonStarted } from ${JSON.stringify(moduleUrl)}\n`
+        + `console.log(JSON.stringify(await ensureDaemonStarted(${JSON.stringify(root)})))\n`
+      const start = () => new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
+        let out = ''
+        child.stdout.on('data', chunk => { out += chunk })
+        child.on('error', reject)
+        child.on('close', () => resolve(out.trim()))
+      })
+
+      // Two separate harnesses asking for the same project at the same moment.
+      const results = (await Promise.all([start(), start()])).map(text => JSON.parse(text))
+      assert.equal(results.filter(r => r.started).length, 2, 'both callers end up with a running daemon')
+      assert.equal(results.filter(r => r.spawned).length, 1, 'exactly one of them spawned it')
+
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+      assert.equal(isProcessAlive(pid), true)
+
+      const listed = spawnSync('pgrep', ['-f', `tgrep serve ${root}`], { encoding: 'utf8' })
+      if (listed.status === 0) {
+        const live = listed.stdout.split('\n').filter(Boolean)
+        assert.equal(live.length, 1, `expected one tgrep serve process, saw ${live.length}`)
+      }
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('gives up early when a spawn cannot win the index', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-blocked-'))
+    let pid
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha\n')
+      await ensureDaemonStarted(root)
+      pid = readServeRecord(join(root, INDEX_DIR_NAME)).pid
+      // Hide the record so the next call spawns a child that must lose to the live server's
+      // lock; the exit must end the wait well before the 5 s budget rather than run it out.
+      await rm(join(root, INDEX_DIR_NAME, 'serve.json'), { force: true })
+
+      const startedAt = Date.now()
+      const result = await ensureDaemonStarted(root, { readyTimeoutMs: 5000 })
+      const elapsed = Date.now() - startedAt
+      assert.equal(result.started, false)
+      assert.match(result.reason, /exited during startup/)
+      assert.ok(elapsed < 4000, `gave up in ${elapsed}ms, not the full budget`)
+      assert.equal(isProcessAlive(pid), true, 'the live server is untouched')
+    } finally {
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already gone */ }
       }
       await rm(root, { recursive: true, force: true })
     }

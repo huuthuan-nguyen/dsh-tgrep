@@ -40,6 +40,12 @@ export const DAEMON_READY_TIMEOUT_MS = 5000
 const DAEMON_POLL_INTERVAL_MS = 250
 
 /**
+ * How long to keep polling after our spawn exits on its own. A losing spawn exits as soon as
+ * `tgrep` sees the winner's lock, while the winner is still publishing its server record.
+ */
+const DAEMON_RACE_GRACE_MS = 1500
+
+/**
  * `tgrep`'s environment with the common install locations prepended, so the binary is found
  * from a host process whose `PATH` lacks Homebrew or Cargo.
  */
@@ -193,13 +199,21 @@ async function spawnDaemon(root, indexDir, options) {
     })
 
     let spawnError = null
+    // `tgrep` refuses a second server for one index directory, so a lost race ends with our
+    // child exiting at once — the winner already holds the lock. Keep polling briefly after
+    // that exit: the winner publishes `serve.json` during its own startup, so giving up the
+    // instant our child dies would report failure for a project that is serving fine. The
+    // grace only shortens the pathological case where nothing ever becomes ready.
+    let exitedAt = null
     child.once('error', (error) => { spawnError = error })
+    child.once('exit', () => { exitedAt = Date.now() })
     child.unref()
 
     const deadline = Date.now() + readyTimeoutMs
     while (Date.now() < deadline) {
       if (claimOwnership(root, indexDir, child.pid)) return { started: true, spawned: true }
       if (spawnError !== null) break
+      if (exitedAt !== null && Date.now() - exitedAt > DAEMON_RACE_GRACE_MS) break
       await delay(DAEMON_POLL_INTERVAL_MS)
     }
 
@@ -207,6 +221,13 @@ async function spawnDaemon(root, indexDir, options) {
     if (daemonAlive(indexDir)) return { started: true, spawned: false }
     if (spawnError !== null) {
       return { started: false, spawned: false, reason: `failed to spawn tgrep serve: ${spawnError.message}` }
+    }
+    if (exitedAt !== null) {
+      return {
+        started: false,
+        spawned: false,
+        reason: `tgrep serve exited during startup — another server may already own ${indexDir} (see ${join(indexDir, 'serve.log')})`,
+      }
     }
     return {
       started: false,
