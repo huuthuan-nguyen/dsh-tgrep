@@ -1,21 +1,26 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, open, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   Config,
+  DAEMON_READY_TIMEOUT_MS,
+  INDEX_DIR_NAME,
   MAX_META_BYTES,
   TGREP_TIMEOUT_MS,
   apply,
   buildTgrepArgs,
   clamp,
   createGrepTool,
+  daemonAlive,
+  ensureDaemonStarted,
   formatGrepMatches,
   groupMatchesByFile,
   normalizeMaxFileSize,
   previewLine,
+  readServeRecord,
   toRelativePath,
   validateInclude,
 } from '../index.js'
@@ -183,6 +188,8 @@ describe('dsh-tgrep Config schema', () => {
       maxLines: 300,
       extraArgs: [],
       maxFileSize: null,
+      autoStartDaemon: true,
+      daemonReadyTimeoutMs: DAEMON_READY_TIMEOUT_MS,
     })
   })
 
@@ -193,6 +200,8 @@ describe('dsh-tgrep Config schema', () => {
       maxLines: 500,
       extraArgs: ['--stats'],
       maxFileSize: '8M',
+      autoStartDaemon: false,
+      daemonReadyTimeoutMs: 2500,
     })
     assert.deepEqual(res.value, {
       enabled: false,
@@ -200,6 +209,8 @@ describe('dsh-tgrep Config schema', () => {
       maxLines: 500,
       extraArgs: ['--stats'],
       maxFileSize: '8M',
+      autoStartDaemon: false,
+      daemonReadyTimeoutMs: 2500,
     })
   })
 
@@ -462,14 +473,112 @@ describe('live tgrep coverage above the default size cap', () => {
         await handle.close()
       }
 
-      const uncapped = await createGrepTool({ maxLines: 300 }).execute({ pattern: marker, path: dir }, {})
+      // autoStartDaemon off: this test is about the size policy, and a daemon here would
+      // build an index beside the 65 MiB fixture and outlive the test.
+      const toolOptions = { maxLines: 300, autoStartDaemon: false }
+      const uncapped = await createGrepTool(toolOptions)
+        .execute({ pattern: marker, path: dir }, { cwd: dir })
       assert.equal(uncapped.matches.length, 1)
 
-      const capped = await createGrepTool({ maxLines: 300, maxFileSize: '64M' })
-        .execute({ pattern: marker, path: dir }, {})
+      const capped = await createGrepTool({ ...toolOptions, maxFileSize: '64M' })
+        .execute({ pattern: marker, path: dir }, { cwd: dir })
       assert.equal(capped.matches.length, 0)
     } finally {
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('workspace daemon auto-start', () => {
+  it('pins the workspace index so subdirectory searches reuse the server', () => {
+    const argv = buildTgrepArgs({
+      pattern: 'x', searchPath: 'src', extraArgs: [], maxFileSize: null, indexPath: '/w/.tgrep',
+    })
+    assert.equal(argv[argv.indexOf('--index-path') + 1], '/w/.tgrep')
+  })
+
+  it('omits the index pin when there is none, and defers to extraArgs', () => {
+    const bare = buildTgrepArgs({ pattern: 'x', searchPath: '.', extraArgs: [], maxFileSize: null })
+    assert.ok(!bare.includes('--index-path'))
+
+    const owned = buildTgrepArgs({
+      pattern: 'x', searchPath: '.', extraArgs: ['--index-path', '/other'], maxFileSize: null, indexPath: '/w/.tgrep',
+    })
+    assert.equal(owned.filter(a => a === '--index-path').length, 1)
+    assert.equal(owned[owned.indexOf('--index-path') + 1], '/other')
+  })
+
+  it('defaults autoStartDaemon on and keeps a bounded readiness budget', () => {
+    const defaults = Config['~standard'].validate({}).value
+    assert.equal(defaults.autoStartDaemon, true)
+    assert.equal(defaults.daemonReadyTimeoutMs, DAEMON_READY_TIMEOUT_MS)
+
+    const off = Config['~standard'].validate({ autoStartDaemon: false, daemonReadyTimeoutMs: 1234 }).value
+    assert.equal(off.autoStartDaemon, false)
+    assert.equal(off.daemonReadyTimeoutMs, 1234)
+    assert.equal(Config['~standard'].validate({ daemonReadyTimeoutMs: 999_999 }).value.daemonReadyTimeoutMs, 60_000)
+  })
+
+  it('treats a stale server record as no daemon', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-tgrep-record-'))
+    try {
+      assert.equal(daemonAlive(dir), false)
+      assert.equal(readServeRecord(dir), undefined)
+
+      await writeFile(join(dir, 'serve.json'), JSON.stringify({ pid: process.pid, port: 1 }))
+      assert.equal(daemonAlive(dir), true, 'a live pid means a live daemon')
+
+      await writeFile(join(dir, 'serve.json'), JSON.stringify({ pid: 999_999, port: 1 }))
+      assert.equal(daemonAlive(dir), false, 'a dead pid must not suppress a restart')
+
+      await writeFile(join(dir, 'serve.json'), 'not json')
+      assert.equal(daemonAlive(dir), false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('live daemon auto-start', () => {
+  it('starts one daemon per workspace and reuses it', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-daemon-'))
+    let pid
+    try {
+      await mkdir(join(root, 'src'), { recursive: true })
+      await writeFile(join(root, 'a.ts'), 'alpha one\n')
+      await writeFile(join(root, 'src', 'b.ts'), 'alpha two\n')
+
+      assert.equal(daemonAlive(join(root, INDEX_DIR_NAME)), false)
+      const first = await ensureDaemonStarted(root)
+      assert.equal(first.started, true)
+      assert.equal(first.spawned, true)
+
+      const second = await ensureDaemonStarted(root)
+      assert.equal(second.started, true)
+      assert.equal(second.spawned, false, 'one daemon per workspace, not one per call')
+
+      const result = await createGrepTool({ maxLines: 300 })
+        .execute({ pattern: 'alpha', path: join(root, 'src') }, { cwd: root })
+      assert.deepEqual(result.matches.map(m => m.line), ['alpha two'])
+    } finally {
+      pid = readServeRecord(join(root, INDEX_DIR_NAME))?.pid ?? pid
+      if (pid !== undefined) {
+        try { process.kill(pid) } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not start a daemon when the option is off', { skip: !tgrepAvailable && 'tgrep is not on PATH' }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-tgrep-nodaemon-'))
+    try {
+      await writeFile(join(root, 'a.ts'), 'alpha one\n')
+      const tool = createGrepTool({ maxLines: 300, autoStartDaemon: false })
+      const result = await tool.execute({ pattern: 'alpha', path: root }, { cwd: root })
+      assert.equal(result.matches.length, 1)
+      assert.equal(daemonAlive(join(root, INDEX_DIR_NAME)), false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
     }
   })
 })

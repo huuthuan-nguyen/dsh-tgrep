@@ -10,7 +10,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { isAbsolute, relative } from 'node:path'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 
 export const name = 'dsh-tgrep'
 
@@ -29,6 +30,159 @@ export const MAX_META_BYTES = 65_536
 /** Per-line preview budget inside `presentationMeta` (mirrors `GREP_MAX_LINE_BYTES`). */
 export const META_LINE_MAX_BYTES = 2000
 
+/** `tgrep`'s own index directory name, relative to the served root. */
+export const INDEX_DIR_NAME = '.tgrep'
+
+/** Default budget for an auto-started daemon to bind, before the search proceeds anyway. */
+export const DAEMON_READY_TIMEOUT_MS = 5000
+
+/** How often the readiness probe re-reads the server record while waiting. */
+const DAEMON_POLL_INTERVAL_MS = 250
+
+/**
+ * `tgrep`'s environment with the common install locations prepended, so the binary is found
+ * from a host process whose `PATH` lacks Homebrew or Cargo.
+ */
+export function tgrepEnv(base = process.env) {
+  const env = { ...base }
+  const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin', `${base.HOME || ''}/.cargo/bin`]
+  const currentPath = env.PATH || ''
+  const currentList = currentPath.split(':')
+  const missing = extraPaths.filter(p => p && !currentList.includes(p))
+  if (missing.length > 0) {
+    env.PATH = `${missing.join(':')}:${currentPath}`
+  }
+  return env
+}
+
+/**
+ * Read `serve.json`, the record `tgrep serve` publishes in its index directory.
+ * @returns the recorded pid/port, or `undefined` when absent or malformed.
+ */
+export function readServeRecord(indexDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(indexDir, 'serve.json'), 'utf8'))
+    if (!Number.isInteger(parsed?.pid) || parsed.pid <= 0) return undefined
+    return { pid: parsed.pid, port: Number.isInteger(parsed?.port) ? parsed.port : undefined }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether a pid is still running. `EPERM` means it exists but belongs to another user.
+ */
+export function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+/**
+ * Whether a live `tgrep serve` currently owns this index directory.
+ *
+ * The record outlives a killed daemon, so the pid must be probed: a stale
+ * `serve.json` alone would suppress every restart attempt.
+ */
+export function daemonAlive(indexDir) {
+  const record = readServeRecord(indexDir)
+  return record !== undefined && isProcessAlive(record.pid)
+}
+
+/** In-flight auto-start attempts, keyed by root: concurrent calls must share one spawn. */
+const daemonAttempts = new Map()
+
+function delay(ms) {
+  return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+/**
+ * Ensure a `tgrep serve` daemon is running for `workdir`, starting one if needed.
+ *
+ * `tgrep` answers a search from its index only when one exists for the SEARCH root, so without
+ * this a user had to run `tgrep serve .` in every project by hand. The daemon is spawned
+ * detached so it outlives the harness, with its output appended to `<root>/.tgrep/serve.log`.
+ *
+ * Best-effort by contract: a failure is reported, never thrown, because the search that follows
+ * still works by scanning. `tgrep` itself refuses a second server for one index directory, so a
+ * lost race ends with a healthy daemon either way — which the final probe confirms.
+ *
+ * @param workdir - workspace root to serve.
+ * @param options - readiness budget overrides.
+ * @returns whether a daemon for this root is running, and whether this call spawned it.
+ */
+export async function ensureDaemonStarted(workdir, options = {}) {
+  const root = resolve(workdir)
+  const indexDir = join(root, INDEX_DIR_NAME)
+
+  if (daemonAlive(indexDir)) return { started: true, spawned: false }
+
+  const inFlight = daemonAttempts.get(root)
+  if (inFlight !== undefined) return inFlight
+
+  const attempt = spawnDaemon(root, indexDir, options)
+  daemonAttempts.set(root, attempt)
+  try {
+    return await attempt
+  } finally {
+    daemonAttempts.delete(root)
+  }
+}
+
+async function spawnDaemon(root, indexDir, options) {
+  const readyTimeoutMs = Number.isFinite(options.readyTimeoutMs) && options.readyTimeoutMs > 0
+    ? options.readyTimeoutMs
+    : DAEMON_READY_TIMEOUT_MS
+
+  let logFd = null
+  try {
+    mkdirSync(indexDir, { recursive: true })
+    logFd = openSync(join(indexDir, 'serve.log'), 'a')
+  } catch {
+    logFd = null
+  }
+
+  try {
+    const child = spawn('tgrep', ['serve', root], {
+      cwd: root,
+      detached: true,
+      // The daemon outlives this process, so it cannot share our stdio.
+      stdio: logFd === null ? 'ignore' : ['ignore', logFd, logFd],
+      windowsHide: true,
+      env: tgrepEnv(),
+    })
+
+    let spawnError = null
+    child.once('error', (error) => { spawnError = error })
+    child.unref()
+
+    const deadline = Date.now() + readyTimeoutMs
+    while (Date.now() < deadline) {
+      if (daemonAlive(indexDir)) return { started: true, spawned: true }
+      if (spawnError !== null) break
+      await delay(DAEMON_POLL_INTERVAL_MS)
+    }
+
+    // A server that appeared during the wait is what this call wanted, whoever spawned it.
+    if (daemonAlive(indexDir)) return { started: true, spawned: false }
+    if (spawnError !== null) {
+      return { started: false, spawned: false, reason: `failed to spawn tgrep serve: ${spawnError.message}` }
+    }
+    return {
+      started: false,
+      spawned: false,
+      reason: `tgrep serve did not become ready within ${readyTimeoutMs}ms (see ${join(indexDir, 'serve.log')})`,
+    }
+  } finally {
+    if (logFd !== null) {
+      try { closeSync(logFd) } catch { /* the child owns its own descriptor */ }
+    }
+  }
+}
+
 /**
  * `tgrep` skips files above 64 MiB by default, where `grep`/ripgrep search them. This plugin
  * therefore passes `--no-max-filesize` unless the config names a cap, so shadowing `grep`
@@ -39,6 +193,11 @@ export const DEFAULT_MAX_FILE_SIZE = null
 /** One `--max-filesize` argument that came from user `extraArgs`, which own the decision. */
 function isMaxFileSizeFlag(argument) {
   return /^--(?:no-)?max-filesize(?:=.*)?$/.test(argument)
+}
+
+/** Either spelling of `tgrep`'s index-directory override. */
+function isIndexPathFlag(argument) {
+  return argument === '--index-path' || argument.startsWith('--index-path=')
 }
 
 /**
@@ -79,6 +238,8 @@ export const Config = {
           maxLines: clamp(Number(val.maxLines) || 300, 20, 5000),
           extraArgs: Array.isArray(val.extraArgs) ? val.extraArgs.map(String) : [],
           maxFileSize: normalizeMaxFileSize(val.maxFileSize),
+          autoStartDaemon: val.autoStartDaemon !== false,
+          daemonReadyTimeoutMs: clamp(Number(val.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
         },
       }
     },
@@ -98,6 +259,8 @@ export function apply(ctx, config = {}) {
     maxLines: clamp(Number(config.maxLines) || 300, 20, 5000),
     extraArgs: Array.isArray(config.extraArgs) ? config.extraArgs.map(String) : [],
     maxFileSize: normalizeMaxFileSize(config.maxFileSize),
+    autoStartDaemon: config.autoStartDaemon !== false,
+    daemonReadyTimeoutMs: clamp(Number(config.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000),
   }
 
   if (!cfg.enabled) {
@@ -188,6 +351,10 @@ function normalizeToolConfig(cfg) {
     maxLines: clamp(Number(source.maxLines) || 300, 20, 5000),
     extraArgs: Array.isArray(source.extraArgs) ? source.extraArgs.map(String) : [],
     maxFileSize: normalizeMaxFileSize(source.maxFileSize),
+    autoStartDaemon: source.autoStartDaemon !== false,
+    daemonReadyTimeoutMs: clamp(
+      Number(source.daemonReadyTimeoutMs) || DAEMON_READY_TIMEOUT_MS, 0, 60_000,
+    ),
   }
 }
 
@@ -204,7 +371,7 @@ function normalizeToolConfig(cfg) {
  */
 export function buildTgrepArgs(options) {
   const {
-    pattern, searchPath, include, caseInsensitive, preferServer, extraArgs, maxFileSize,
+    pattern, searchPath, include, caseInsensitive, preferServer, extraArgs, maxFileSize, indexPath,
   } = options
 
   const cliArgs = ['--json']
@@ -223,6 +390,14 @@ export function buildTgrepArgs(options) {
 
   for (const argument of extraArgs) {
     cliArgs.push(argument)
+  }
+
+  // `tgrep` resolves its index relative to the SEARCH root, so a search limited to a
+  // subdirectory would scan even while the workspace daemon is up. Pinning the workspace
+  // index directory lets it answer from that server instead; pointed at a tree the index
+  // does not cover, `tgrep` falls back to scanning rather than answering wrongly.
+  if (indexPath && !extraArgs.some(isIndexPathFlag)) {
+    cliArgs.push('--index-path', indexPath)
   }
 
   if (!extraArgs.some(isMaxFileSizeFlag)) {
@@ -330,7 +505,9 @@ function grepSearchMeta(matches, maxMatches) {
  * and the private scheduler `Symbol()` then mismatches the host's.
  */
 export function createGrepTool(cfg) {
-  const { preferServer, maxLines, extraArgs, maxFileSize } = normalizeToolConfig(cfg)
+  const {
+    preferServer, maxLines, extraArgs, maxFileSize, autoStartDaemon, daemonReadyTimeoutMs,
+  } = normalizeToolConfig(cfg)
   return {
     name: 'grep',
     description:
@@ -440,6 +617,19 @@ export function createGrepTool(cfg) {
       const workdir = resolveCwd(exec)
       const searchPath = args.path ? String(args.path) : '.'
 
+      // A daemon makes the workspace root's index reusable, which `tgrep` only does for a
+      // search rooted at that same directory. Best-effort: a failure is logged, never thrown,
+      // because the search below still answers by scanning.
+      let indexPath
+      const workspaceIndex = join(workdir, INDEX_DIR_NAME)
+      if (autoStartDaemon) {
+        const daemon = await ensureDaemonStarted(workdir, { readyTimeoutMs: daemonReadyTimeoutMs })
+        if (!daemon.started && daemon.reason !== undefined) {
+          exec?.agent?.ctx?.logger?.warn?.(`[dsh-tgrep] ${daemon.reason}`)
+        }
+        if (existsSync(workspaceIndex)) indexPath = workspaceIndex
+      }
+
       const cliArgs = buildTgrepArgs({
         pattern: args.pattern,
         searchPath,
@@ -448,6 +638,7 @@ export function createGrepTool(cfg) {
         preferServer,
         extraArgs,
         maxFileSize,
+        indexPath,
       })
 
       const matches = await runTgrep(cliArgs, {
@@ -494,14 +685,7 @@ function runTgrep(cliArgs, { signal, cwd, maxMatches }) {
     }
 
     // Augment PATH so tgrep is discovered across macOS Homebrew, Cargo, and system bin
-    const env = { ...process.env }
-    const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin', `${process.env.HOME || ''}/.cargo/bin`]
-    const currentPath = env.PATH || ''
-    const currentList = currentPath.split(':')
-    const missing = extraPaths.filter(p => p && !currentList.includes(p))
-    if (missing.length > 0) {
-      env.PATH = `${missing.join(':')}:${currentPath}`
-    }
+    const env = tgrepEnv()
 
     const child = spawn('tgrep', cliArgs, {
       cwd: cwd || process.cwd(),

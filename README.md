@@ -24,8 +24,9 @@ underneath:
 1. **Trigram index** — `tgrep` answers a query from its trigram index, so repeated searches
    over an indexed tree return without re-walking every file (≈**15×** measured on a mid-size
    repo — see [⚡ Performance & Trade-offs](#-performance--trade-offs)).
-2. **Persistent daemon** — a running `tgrep serve` keeps the index hot across calls and
-   sessions, with no per-call cold start.
+2. **Automatic daemon** — the workspace's `tgrep serve` is started for you on first use
+   (`autoStartDaemon`) and stays hot across calls and sessions, so there is no manual
+   `tgrep serve .` per project and no per-call cold start.
 3. **Graceful degradation** — with no index and no daemon, `tgrep` scans files much like
    `grep` does today, so a fresh workspace still works.
 4. **Agent-plane shadowing** — the tool registers into each agent's own tool scope, so it
@@ -95,7 +96,10 @@ index benefit rather than falling back to a scan.
 ### When the margin shrinks — or reverses
 
 - **No index, no benefit.** Without a built index (or a running `tgrep serve`), `tgrep` scans
-  like ripgrep. The first search on a large tree is therefore not faster.
+  like ripgrep, so the first search on a large tree is not faster. `autoStartDaemon` (on by
+  default) removes the manual step: the daemon is spawned for the workspace root on the first
+  search and later searches reuse it — see [Indexing & the Background
+  Daemon](#-indexing--the-background-daemon).
 - **Small repos and broad queries.** The margin depends on repo size and on how many matches a
   query returns: a search returning tens of thousands of matches spends more on *delivering*
   them than the index saves on *finding* them. On Kubernetes/Linux, Microsoft measured a
@@ -174,7 +178,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.3
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.5
 ```
 
 ### Method 2: From the NPM Registry
@@ -221,24 +225,48 @@ When installed, `dsh-tgrep` contributes a default configuration layer. You can c
         # means --no-max-filesize, matching grep/ripgrep coverage; set a size
         # such as "64M" or "8M" to cap instead.
         # maxFileSize: "64M"
+        # Start a `tgrep serve` daemon for the session workspace when none is
+        # running, so no manual `tgrep serve .` is needed per project.
+        autoStartDaemon: true
+        # How long a search waits for a freshly spawned daemon to bind before
+        # proceeding anyway (it scans meanwhile, so the call never fails).
+        daemonReadyTimeoutMs: 5000
 ```
 
 ---
 
-## 🗂️ Indexing Your Codebase (Optional but Recommended)
+## 🗂️ Indexing & the Background Daemon
 
-`tgrep` works out-of-the-box without an index by scanning files. For maximum speed in large workspaces:
+`tgrep` works out-of-the-box without an index by scanning files — it just isn't faster that
+way. Indexing is what unlocks the [⚡ numbers above](#-performance--trade-offs).
 
-1. **Build a local index**:
-   ```bash
-   cd /path/to/your/project
-   tgrep index .
-   ```
-2. **Or run a persistent search daemon**:
-   ```bash
-   tgrep serve
-   ```
-   `tgrep` will automatically connect to the background server for sub-millisecond queries.
+**You normally do not have to do anything.** With `autoStartDaemon` on (the default), the first
+`grep` in a workspace checks `<workspace>/.tgrep/serve.json` for a live `tgrep serve` and spawns
+one, detached, when it finds none:
+
+- The daemon serves the **session workspace root**, builds the index in the background, and
+  keeps it fresh with a file watcher. Searches never wait for it: while it is still indexing
+  they scan the tree exactly as before, so the first call is correct and later calls are fast.
+- Its output goes to `<workspace>/.tgrep/serve.log`; the readiness record is
+  `<workspace>/.tgrep/serve.json` (`{"pid":…,"port":…}`).
+- One daemon per workspace: concurrent calls share a single attempt, and `tgrep` itself refuses
+  a second server for the same index directory, so a lost race still ends with one live server.
+- Searches pass `--index-path <workspace>/.tgrep`. `tgrep` resolves its index relative to the
+  **search** root, so without this a search limited to `src/` would scan even with the workspace
+  server up. Pointed at a tree the index does not cover, `tgrep` falls back to scanning rather
+  than answering wrongly.
+- A stale `serve.json` left by a killed daemon does not block a restart: the recorded pid is
+  probed, not trusted.
+
+Prefer to manage it yourself? Set `autoStartDaemon: false` — the plugin then touches no daemon
+and no index path. Doing it by hand stays available:
+
+```bash
+cd /path/to/your/project
+tgrep index .        # build the index once
+tgrep serve          # or keep a server running (auto-builds and watches)
+tgrep status .       # shows whether a server is running for this tree
+```
 
 ---
 

@@ -14,3 +14,9 @@
         # silently drop matches. Set a size here to cap instead (e.g. "64M",
         # "8M"), trading coverage for scan time on repos with huge files.
         # maxFileSize: "64M"
+        # Start a `tgrep serve` daemon for the session workspace when none is
+        # running, so no manual `tgrep serve .` is needed per project.
+        autoStartDaemon: true
+        # How long a search waits for a freshly spawned daemon to bind before
+        # proceeding anyway (it scans meanwhile, so the call never fails).
+        daemonReadyTimeoutMs: 5000
