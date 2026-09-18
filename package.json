@@ -6,7 +6,7 @@
   },
   "homepage": "https://github.com/huuthuan-nguyen/dsh-tgrep#readme",
   "name": "dsh-tgrep",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Shadow built-in grep with Microsoft tgrep (trigram-indexed search) for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
