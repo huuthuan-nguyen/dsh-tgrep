@@ -1,5 +1,6 @@
 # ⚡ DSH-Tgrep: Trigram-Indexed Code Search for DeepSeek Harness
 
+[![npm version](https://img.shields.io/npm/v/dsh-tgrep.svg)](https://www.npmjs.com/package/dsh-tgrep)
 [![GitHub release](https://img.shields.io/github/v/release/huuthuan-nguyen/dsh-tgrep)](https://github.com/huuthuan-nguyen/dsh-tgrep/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![DeepSeek Harness plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4D6BFE)](https://github.com/deepseek-ai/deepseek-harness)
@@ -170,29 +171,28 @@ plugin passes `--no-max-filesize` so shadowing `grep` cannot silently drop match
 
 You do **not** need to clone or compile this repository manually. DeepSeek Harness installs it directly into any profile:
 
-### Method 1: Directly from GitHub (Recommended)
-
-Install straight from GitHub, optionally pinned to a release tag:
+### Method 1: From the NPM Registry (Recommended)
 
 ```bash
-# Latest from default branch
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
-
-# Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.11
-```
-
-### Method 2: From the NPM Registry
-
-> ⚠️ **Stale on npm** — the registry's `latest` is still `0.1.0`, published before the
-> `0.1.2`/`0.1.3` fixes. Prefer Method 1 until a newer version is published.
-
-```bash
-# For Web GUI profile
+# For the Web GUI profile
 dsh plugin --profile web add dsh-tgrep
 
-# Or for headless / TUI profile
+# Or for a headless / TUI profile
 dsh plugin --profile tui add dsh-tgrep
+```
+
+Installs the registry's `latest` — check it with `npm view dsh-tgrep version`.
+
+### Method 2: Directly from GitHub
+
+Same code, no registry — useful to pin an exact release:
+
+```bash
+# Latest from the default branch
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
+
+# Or pinned to a release tag
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.12
 ```
 
 ### Method 3: From Local Checkout (For development/contributors)
