@@ -6,7 +6,7 @@
   },
   "homepage": "https://github.com/huuthuan-nguyen/dsh-tgrep#readme",
   "name": "dsh-tgrep",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Shadow built-in grep with Microsoft tgrep (trigram-indexed search) for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
@@ -22,7 +22,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "node --test"
   },
   "keywords": [
     "dsh-plugin",
@@ -40,5 +41,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

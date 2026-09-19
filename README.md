@@ -179,7 +179,7 @@ Install straight from GitHub, optionally pinned to a release tag:
 dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep
 
 # Or pinned to a specific release tag
-dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.10
+dsh plugin --profile web add github:huuthuan-nguyen/dsh-tgrep#v0.1.11
 ```
 
 ### Method 2: From the NPM Registry
